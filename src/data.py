@@ -284,3 +284,140 @@ class CS_VideoData(pl.LightningDataModule):
         """
         return self._dataloader(subset="test")
 
+
+
+
+import os.path as osp
+import glob, numpy as np, torch
+from PIL import Image
+from collections.abc import Mapping
+
+# ---------------- helpers ----------------
+def _pil_to_float_chw(img: Image.Image) -> torch.Tensor:
+    """PIL RGB -> float32 tensor (3,H,W) in [0,1]."""
+    arr = np.array(img, dtype=np.float32) / 255.0  # (H,W,3)
+    t = torch.from_numpy(arr).permute(2, 0, 1)     # (3,H,W)
+    return t
+
+def _load_depth_tensor(path: str) -> torch.Tensor:
+    """Load depth PNG -> float32 (1,H,W)."""
+    d = np.array(Image.open(path)).astype(np.float32)
+    if d.ndim == 3:
+        d = d[...,0]
+    return torch.from_numpy(d).unsqueeze(0)
+
+def _dummy_K(H, W, f_scale=1.2):
+    f = f_scale * max(H, W)
+    cx, cy = W/2.0, H/2.0
+    return torch.tensor([[f,0,cx],[0,f,cy],[0,0,1]], dtype=torch.float32)
+
+def _dummy_pose():
+    return torch.eye(4, dtype=torch.float32)
+
+# ---------------- dataset ----------------
+class CityscapesFloatViews(torch.utils.data.Dataset):
+    """
+    Produces float tensors in [0,1]:
+      - Train: returns list[dict] of length sequence_length; each has
+          img (float32 3xHxW), depthmap zeros (float32 1xHxW)
+      - Val (eval_modality='depth'): last view includes real depth
+    No spatial/temporal preprocessing.
+    """
+    def __init__(self, base_ds):
+        self.base = base_ds
+        self.seq_len = base_ds.sequence_length
+        self.subset = base_ds.subset
+        self.aug = base_ds.augmentations
+        self.eval_mode = base_ds.eval_mode
+        self.eval_midterm = base_ds.eval_midterm
+        self.eval_modality = base_ds.eval_modality
+        self.data_path = base_ds.data_path
+        self.sequences = base_ds.sequences
+
+    def __len__(self): return len(self.sequences)
+
+    def _sequence_filepaths(self, sequence_name):
+        parts = sequence_name.split("_")
+        if len(parts) == 2:
+            city = parts[0]
+            return sorted(glob.glob(osp.join(self.data_path, self.subset, city, sequence_name + "*.png")))
+        elif len(parts) == 3:
+            city, seqid, start = parts
+            start_i = int(start)
+            return [osp.join(self.data_path, self.subset, city,
+                             f"{city}{seqid}{start_i+i:06d}_leftImg8bit.png")
+                    for i in range(30)]
+        raise RuntimeError(f"Bad sequence name: {sequence_name}")
+
+    def _choose_indices_train(self, n=30):
+        if self.aug.get("no_timestep_augm", False):
+            num_frames_skip = 2
+        elif self.aug.get("timestep_augm", None) is not None:
+            probs = self.aug["timestep_augm"]
+            num_frames_skip = np.random.choice(list(range(1, len(probs)+1)), p=probs)
+        else:
+            num_frames_skip = np.random.randint(1,4)
+        step = num_frames_skip + 1
+        start_max = n - step*self.seq_len + num_frames_skip
+        start = np.random.randint(0, start_max + 1)
+        return list(range(start, start + step*self.seq_len, step))
+
+    def _choose_indices_eval(self, n=30):
+        num_frames_skip, step = 2, 3
+        start = 20 - step*self.seq_len + num_frames_skip - (6 if self.eval_midterm and self.seq_len < 7 else 0)
+        return list(range(start, start + step*self.seq_len, step))
+
+    def __getitem__(self, idx):
+        seq = self.sequences[idx]
+        files = self._sequence_filepaths(seq)
+        idxs = self._choose_indices_eval(len(files)) if self.eval_mode else self._choose_indices_train(len(files))
+
+        gt_path = files[19] if len(files) > 19 else files[-1]
+        gt_depth_path = gt_path.replace("leftImg8bit_sequence", "leftImg8bit_sequence_depthv2") \
+                               .replace("leftImg8bit.png", "leftImg8bit_depth.png")
+
+        views = []
+        for t, fi in enumerate(idxs):
+            impath = files[fi]
+            img_t = _pil_to_float_chw(Image.open(impath).convert("RGB"))  # (3,H,W), float32 0–1
+            H, W = img_t.shape[-2:]
+            if self.eval_mode and self.eval_modality == "depth" and t == len(idxs)-1:
+                try:
+                    depth_t = _load_depth_tensor(gt_depth_path)
+                except Exception:
+                    depth_t = torch.zeros((1,H,W), dtype=torch.float32)
+            else:
+                depth_t = torch.zeros((1,H,W), dtype=torch.float32)
+
+            views.append(dict(
+                img=img_t, depthmap=depth_t,
+                camera_pose=_dummy_pose(),
+                camera_intrinsics=_dummy_K(H, W),
+                dataset="Cityscapes",
+                label=seq, instance=impath,
+                is_video=torch.tensor(True),
+                camera_only=torch.tensor(False),
+                depth_only=torch.tensor(False),
+                single_view=torch.tensor(False),
+                reset=torch.tensor(False),
+            ))
+        return views
+
+# ---------------- collate ----------------
+def _stack_field(xs):
+    if all(isinstance(x, torch.Tensor) for x in xs):
+        return torch.stack(xs, 0)
+    if all(isinstance(x, (int, float, np.number)) for x in xs):
+        return torch.tensor(xs, dtype=torch.float32)
+    if all(isinstance(x, str) for x in xs): return xs
+    if all(isinstance(x, Mapping) for x in xs):
+        return {k: _stack_field([x[k] for x in xs]) for k in xs[0]}
+    if all(isinstance(x, list) for x in xs):
+        L = len(xs[0]); assert all(len(x)==L for x in xs)
+        return [_stack_field([x[i] for x in xs]) for i in range(L)]
+    return xs
+
+def collate_list_of_views(batch):
+    num_views = len(batch[0])
+    assert all(len(b)==num_views for b in batch)
+    return [_stack_field([sample[v] for sample in batch]) for v in range(num_views)]

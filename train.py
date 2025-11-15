@@ -17,7 +17,7 @@ def parse_list(x):
 
 parser = argparse.ArgumentParser()
 # Data Parameters
-parser.add_argument('--data_path', type=str, default='/home/ubuntu/cityscapes')
+parser.add_argument('--data_path', type=str, default='/workspace/cityscapes')
 parser.add_argument('--dst_path', type=str, default=None)
 parser.add_argument('--img_size', type=parse_tuple, default=(224,448))
 parser.add_argument('--num_workers', type=int, default=8)
@@ -94,6 +94,29 @@ pl.seed_everything(args.seed, workers=True)
 data = CS_VideoData(arguments=args,subset='train',batch_size=args.batch_size)
 
 
+
+from src.data import CityScapesRGBDataset, CityscapesFloatViews, collate_list_of_views
+train_base = CityScapesRGBDataset(args.data_path, args, args.sequence_length, args.img_size,
+                                  subset="train", eval_mode=False, feature_extractor=args.feature_extractor)
+val_base   = CityScapesRGBDataset(args.data_path, args, args.sequence_length, args.img_size,
+                                  subset="val",   eval_mode=True,  feature_extractor=args.feature_extractor)
+args.eval_modality = "depth"
+
+train_ds = CityscapesFloatViews(train_base)
+val_ds   = CityscapesFloatViews(val_base)
+
+train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
+    shuffle=True, num_workers=0,
+    drop_last=True, collate_fn=collate_list_of_views)
+
+batch = next(iter(train_loader))
+for key, val in batch[0].items():
+    if isinstance(val, torch.Tensor) or isinstance(val, np.ndarray):
+        val = val.shape
+    print(key, val)
+
+
+assert False
 if args.precision == '32':
     args.precision = 32
 

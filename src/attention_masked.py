@@ -300,3 +300,200 @@ class AddBroadcastPosEmbed(nn.Module):
 
         embs = torch.cat(embs, dim=self.dim)
         return x + embs
+    
+
+
+# === New, additive classes (do not override your originals) ===================
+import torch
+import einops
+from torch import nn
+
+# --- simple temporal PE for the pose token (time-aware + token-type bias) ---
+class PoseTemporalPE(nn.Module):
+    def __init__(self, T, dim, init_std=0.02):
+        super().__init__()
+        self.temb = nn.Embedding(T, dim)
+        nn.init.trunc_normal_(self.temb.weight, std=init_std)
+        self.type_bias = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.type_bias, std=init_std)
+
+    def forward(self, B, T, device):
+        t_ids = torch.arange(T, device=device)                   # (T,)
+        pe = self.temb(t_ids)[None].expand(B, T, -1)             # (B,T,C)
+        pe = pe + self.type_bias                                 # (B,T,C)
+        return pe.unsqueeze(2)                                   # (B,T,1,C)
+
+
+# --- separable encoder that knows about extra per-frame tokens (pose slots) ---
+class TransformerEncoderSeparableWithPose(nn.Module):
+    """
+    Drop-in variant of your separable encoder that also takes pose_n per frame.
+    window_size=1 path is implemented for simplicity (as requested).
+    """
+    def __init__(self, dim, depth, heads, mlp_dim, dropout=0., window_size=1):
+        super().__init__()
+        self.window_size = window_size
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                PreNorm(dim, Attention(dim, heads, dropout=dropout)),  # temporal
+                PreNorm(dim, Attention(dim, heads, dropout=dropout)),  # spatial
+                PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout))
+            ]))
+
+    def forward(self, x, full_shape, pose_n=0):
+        """
+        x:          (B, T*(H*W + pose_n), C) when window_size == 1
+        full_shape: [B, T, H, W, C_in]
+        pose_n:     int, number of per-frame extra tokens (0 or 1)
+        """
+        b, t, h, w, _ = full_shape
+        assert self.window_size == 1, "Pose path currently supports window_size=1."
+        p = h * w + pose_n  # spatial length per frame
+
+        l_attn = []
+        for attn_temporal, attn_spatial, ff in self.layers:
+            # Temporal attention: for each spatial slot, attend over time
+            xt = einops.rearrange(x, 'b (t p) c -> (b p) t c', b=b, t=t, p=p)
+            a_val_t, a_w_t = attn_temporal(xt)
+            xt = xt + a_val_t
+            l_attn.append(a_w_t)
+
+            # Spatial attention: for each time step, attend over spatial positions (incl. pose slot)
+            xs = einops.rearrange(xt, '(b p) t c -> (b t) p c', b=b, t=t, p=p)
+            a_val_s, a_w_s = attn_spatial(xs)
+            xs = xs + a_val_s
+            l_attn.append(a_w_s)
+
+            # MLP + residual, back to (B, T*P, C)
+            x = einops.rearrange(xs, '(b t) p c -> b (t p) c', b=b, t=t, p=p)
+            x = x + ff(x)
+
+        return x, l_attn
+
+
+# --- main model that accepts an optional pose token and returns both outputs ---
+class MaskTransformerWithPose(nn.Module):
+    """
+    New class that mirrors your MaskTransformer but can also take a per-frame pose token
+    (B x T x 1 x C_in). It returns (grid_pred, pose_pred) when pose is provided,
+    otherwise it behaves like your original (returns only grid_pred).
+    """
+    def __init__(self, shape, img_size=256, embedding_dim=768, hidden_dim=768, codebook_size=1024,
+                 depth=24, heads=8, mlp_dim=3072, dropout=0.1, one_var=False, use_fc_bias=False,
+                 use_first_last=False, seperable_attention=True, seperable_window_size=1, train_aux=False):
+        super().__init__()
+        self.shape = shape  # [T, H, W]
+        T, H, W = shape
+        self.seperable_attention = seperable_attention
+
+        # Positional embeddings for the geometry grid (reuse your module)
+        self.pos_embd = AddBroadcastPosEmbed(shape=shape, embd_dim=hidden_dim)
+
+        # Simple temporal PE for the pose token
+        self.pose_pe = PoseTemporalPE(T=T, dim=hidden_dim)
+
+        # Optional first/last layers (mirror your setup)
+        self.first_layer = nn.Identity()
+        if use_first_last:
+            self.first_layer = nn.Sequential(
+                nn.LayerNorm(hidden_dim, eps=1e-12),
+                nn.Dropout(p=dropout),
+                nn.Linear(in_features=hidden_dim, out_features=hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim, eps=1e-12),
+                nn.Dropout(p=dropout),
+                nn.Linear(in_features=hidden_dim, out_features=hidden_dim),
+            )
+
+        self.last_layer = nn.Identity()
+        if use_first_last:
+            self.last_layer = nn.Sequential(
+                nn.LayerNorm(hidden_dim, eps=1e-12),
+                nn.Dropout(p=dropout),
+                nn.Linear(in_features=hidden_dim, out_features=hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim, eps=1e-12),
+            )
+
+        # In/out projections
+        self.fc_in  = nn.Linear(hidden_dim, hidden_dim, bias=use_fc_bias)
+        self.fc_out = nn.Linear(hidden_dim, embedding_dim, bias=use_fc_bias)
+        self.fc_in.weight.data.normal_(std=0.02)
+        self.fc_out.weight.data.copy_(torch.zeros(embedding_dim, hidden_dim))
+
+        # Transformer backbone
+        if seperable_attention:
+            self.transformer = TransformerEncoderSeparableWithPose(
+                dim=hidden_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout,
+                window_size=seperable_window_size
+            )
+        else:
+            # falls back to your vanilla encoder (no pose specialization needed)
+            self.transformer = TransformerEncoder(
+                dim=hidden_dim, depth=depth, heads=heads, mlp_dim=mlp_dim, dropout=dropout
+            )
+
+    @torch.no_grad()
+    def _check_shapes(self, vid_token, pose_token):
+        b, t, h, w, c_in = vid_token.size()
+        if pose_token is not None:
+            assert pose_token.shape[:3] == (b, t, 1), \
+                f"pose_token must be (B,T,1,C), got {pose_token.shape}"
+            assert pose_token.shape[-1] == c_in, \
+                f"pose_token C must match vid_token C ({c_in}), got {pose_token.shape[-1]}"
+        return b, t, h, w, c_in
+
+    def forward(self, vid_token, pose_token=None, y=None, drop_label=None, return_attn=False):
+        """
+        vid_token:  B x T x H x W x C_in (geometry features)
+        pose_token: (optional) B x T x 1 x C_in (per-frame pose features)
+        Returns:
+            - If pose provided:  grid_pred (B,T,H,W,C_out), pose_pred (B,T,1,C_out)
+            - Else:              grid_pred (B,T,H,W,C_out)
+        """
+        b, t, h, w, c_in = self._check_shapes(vid_token, pose_token)
+
+        # Project + add broadcasted (T,H,W) PE to the grid
+        grid = self.fc_in(vid_token)               # (B,T,H,W,C)
+        grid = self.pos_embd(grid)                 # (B,T,H,W,C)
+        grid = einops.rearrange(grid, 'b t h w c -> b t (h w) c')  # (B,T,Pg,C), Pg=H*W
+
+        pose_n = 0
+        if pose_token is not None:
+            pose_n = 1
+            pose = self.fc_in(pose_token)                  # (B,T,1,C)
+            pose = pose + self.pose_pe(B=b, T=t, device=pose.device)  # (B,T,1,C)
+            x = torch.cat([grid, pose], dim=2)             # (B,T,Pg+1,C)
+        else:
+            x = grid                                       # (B,T,Pg,C)
+
+        # pack to sequence (B, T*P, C)
+        x = einops.rearrange(x, 'b t p c -> b (t p) c')
+
+        # transformer
+        x = self.first_layer(x)
+        if self.seperable_attention:
+            x, attn = self.transformer(x, full_shape=[b, t, h, w, c_in], pose_n=pose_n)
+        else:
+            x, attn = self.transformer(x, full_shape=[b, t, h, w, c_in])
+
+        x = self.last_layer(x)
+        x = self.fc_out(x)  # (B, T*P, C_out)
+
+        # unpack + split
+        p = h * w + pose_n
+        x = einops.rearrange(x, 'b (t p) c -> b t p c', t=t, p=p)
+        if pose_n == 1:
+            grid_pred = x[:, :, :h*w, :]
+            pose_pred = x[:, :, h*w:, :]    # (B,T,1,C_out)
+        else:
+            grid_pred = x
+            pose_pred = None
+
+        grid_pred = einops.rearrange(grid_pred, 'b t (h w) c -> b t h w c', h=h, w=w)
+
+        if return_attn:
+            return (grid_pred, pose_pred), attn
+        else:
+            return grid_pred, pose_pred
