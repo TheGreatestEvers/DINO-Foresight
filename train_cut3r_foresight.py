@@ -5,8 +5,12 @@ from pytorch_lightning.callbacks import LearningRateMonitor      # <-- ADDED
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import glob
+from torch.utils.data import DataLoader, Subset
+import torch
 
 from src.dino_f import Dino_f  # your modified class that supports feature_extractor='external'
+
+DEBUG = False
 
 def _stack_or_list(xs, dim=0):
     """Try to stack a list of Tensors. If shapes differ or any element is None, return the list unchanged."""
@@ -50,81 +54,77 @@ def collate_fused_view(batch):
     pose_b  = _stack_or_list(pose_list,  dim=0)   # [B, T, 7]    or list/None
     return feats_b, depth_b, pose_b
 
-from torch.utils.data import DataLoader, Subset
-import torch
 
-def make_loaders(args):
-    import sys
-    sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
-    from data_dino_foresight import SelectedFusedImgFeatConcatDataset
+if not DEBUG:
+    def make_loaders(args):
+        import sys
+        sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
+        from data_dino_foresight import SelectedFusedImgFeatConcatDataset
 
-    g = torch.Generator().manual_seed(42)
+        g = torch.Generator().manual_seed(42)
 
-    train_ds = SelectedFusedImgFeatConcatDataset(args.train_features_path)
-    val_ds   = SelectedFusedImgFeatConcatDataset(args.val_features_path, return_view=True)
+        train_ds = SelectedFusedImgFeatConcatDataset(args.train_features_path)
+        val_ds   = SelectedFusedImgFeatConcatDataset(args.val_features_path, return_view=True)
 
-    # Take only a small subset of the training set
-    #n_train_samples = 16
-    #train_ds = Subset(train_ds, torch.randperm(len(train_ds), generator=g)[:n_train_samples].tolist())
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=True,
+            collate_fn=collate_fused_view
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=getattr(args, "num_workers_val", None) or args.num_workers,
+            pin_memory=True, collate_fn=collate_fused_view
+        )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
-        collate_fn=collate_fused_view
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=getattr(args, "num_workers_val", None) or args.num_workers,
-        pin_memory=True, collate_fn=collate_fused_view
-    )
+        return train_loader, val_loader
+else:
 
-    return train_loader, val_loader
 
-"""
 # For debugging
 def make_loaders(args):
-    import sys
-    sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
-    from data_dino_foresight import SelectedFusedImgFeatConcatDataset
+        import sys
+        sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
+        from data_dino_foresight import SelectedFusedImgFeatConcatDataset
 
-    g = torch.Generator().manual_seed(42)
+        g = torch.Generator().manual_seed(42)
 
-    # -------------------------------
-    # DEBUG MODE: use the SAME items for train and val
-    # - Train: feats only (return_view=False)
-    # - Val  : feats + (depth, pose) (return_view=True)
-    # We pick items from a single root (val path by default) so
-    # indices match exactly across the two dataset instances.
-    # -------------------------------
+        # -------------------------------
+        # DEBUG MODE: use the SAME items for train and val
+        # - Train: feats only (return_view=False)
+        # - Val  : feats + (depth, pose) (return_view=True)
+        # We pick items from a single root (val path by default) so
+        # indices match exactly across the two dataset instances.
+        # -------------------------------
 
-    # choose which root to pull from for both
-    root = args.val_features_path  # or args.train_features_path
+        # choose which root to pull from for both
+        root = args.val_features_path  # or args.train_features_path
 
-    # one dataset instance to derive the indices deterministically
-    base_ds = SelectedFusedImgFeatConcatDataset(root, return_view=False)
-    n = min(len(base_ds), int(getattr(args, "debug_num_samples", 16)))
-    idx = torch.arange(n).tolist()  # first N samples; or torch.randperm for random
+        # one dataset instance to derive the indices deterministically
+        base_ds = SelectedFusedImgFeatConcatDataset(root, return_view=False)
+        n = min(len(base_ds), int(getattr(args, "debug_num_samples", 16)))
+        idx = torch.arange(n).tolist()  # first N samples; or torch.randperm for random
 
-    # build train/val with identical indices but different return_view
-    train_ds = Subset(
-        SelectedFusedImgFeatConcatDataset(root, return_view=False), idx
-    )
-    val_ds = Subset(
-        SelectedFusedImgFeatConcatDataset(root, return_view=True), idx
-    )
+        # build train/val with identical indices but different return_view
+        train_ds = Subset(
+            SelectedFusedImgFeatConcatDataset(root, return_view=False), idx
+        )
+        val_ds = Subset(
+            SelectedFusedImgFeatConcatDataset(root, return_view=True), idx
+        )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False,
-        collate_fn=collate_fused_view
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=getattr(args, "num_workers_val", None) or args.num_workers,
-        pin_memory=True, drop_last=False,       # keep complete eval set
-        collate_fn=collate_fused_view
-    )
-    return train_loader, val_loader"""
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, pin_memory=True, drop_last=False,
+            collate_fn=collate_fused_view
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=getattr(args, "num_workers_val", None) or args.num_workers,
+            pin_memory=True, drop_last=False,       # keep complete eval set
+            collate_fn=collate_fused_view
+        )
+        return train_loader, val_loader
 
 
 # --------------------------------------------------------------------------
@@ -160,7 +160,7 @@ def build_argparser():
     # Model capacity
     p.add_argument('--hidden_dim', type=int, default=1152)
     p.add_argument('--heads', type=int, default=8)
-    p.add_argument('--layers', type=int, default=14)
+    p.add_argument('--layers', type=int, default=12)
     p.add_argument('--dropout', type=float, default=0.2)
     p.add_argument('--attn_dropout', type=float, default=0.3)
     p.add_argument('--seperable_attention', action='store_true', default=True)
@@ -177,11 +177,13 @@ def build_argparser():
     p.add_argument('--num_gpus', type=int, default=1)
     p.add_argument('--precision', type=str, default='32-true', choices=['16-true','16-mixed','32-true','32'])
     p.add_argument('--seed', type=int, default=123)
-    p.add_argument('--lr_base', type=float, default=1e-3, help='LR at effective batch size 8')
+    p.add_argument('--lr_base', type=float, default=2e-5, help='LR at effective batch size 8')
     p.add_argument('--gclip', type=float, default=1.0)
     p.add_argument('--dst_path', type=str, default=None)
     p.add_argument('--eval_freq', type=int, default=1)
     p.add_argument('--vis_attn', action='store_true', default=False)
+    p.add_argument('--warmup_p', type=float, default=0.0,
+               help='Fraction of max_steps used for LR warmup')
 
     # Evaluation toggles
     p.add_argument('--evaluate', action='store_true', default=False,
@@ -200,7 +202,7 @@ def build_argparser():
     p.add_argument('--depth_post_clip_max', type=float, default=70.0)
 
     # 3D / pose eval cadence
-    p.add_argument('--eval3d_every_n_epochs', type=int, default=2)
+    p.add_argument('--eval3d_every_n_epochs', type=int, default=200 if not DEBUG else 1)
     p.add_argument('--step', type=int, default=1)
     p.add_argument('--eval_midterm', action='store_true', default=False)
     p.add_argument('--evaluate_baseline', action='store_true', default=False)
@@ -226,8 +228,8 @@ def setup_args_defaults(args):
     args.single_step_sample_train = True
     # depth cfg already parsed above
 
-    args.eval_ckpt_only = True
-    args.ckpt = "/workspace/DINO-Foresight/lightning_logs/version_56/checkpoints/epoch=88-step=89890.ckpt"
+    args.eval_ckpt_only = False
+    args.ckpt = None
     
     args.eval_mode = False  # will flip to True when evaluating
     return args
@@ -264,15 +266,35 @@ def setup_dist_env(args):
     return args
 
 def scale_and_set_lr_args(args, steps_per_epoch):
-    # Steps/EBS/LR scaling
-    args.max_steps = args.max_epochs * max(1, steps_per_epoch // max(1, args.world_size * args.accum_iter))
-    args.warmup_p = 0.0
-    args.warmup_steps = int(args.warmup_p * args.max_steps)
+    """
+    Mimic the original logic:
+
+      max_steps = max_epochs * (len(train_loader) // (num_gpus * accum_iter))
+      effective_batch_size = batch_size * world_size * accum_iter
+      lr = lr_base * (effective_batch_size / 8), where lr_base is defined for EBS=8
+    """
+    # Steps per global optimizer update
+    # (len(train_loader) is per-rank, but your original formula divided by num_gpus anyway)
+    global_steps_per_epoch = max(
+        1,
+        steps_per_epoch // max(1, args.num_gpus * args.accum_iter)
+    )
+    args.max_steps = args.max_epochs * global_steps_per_epoch
+
+    # Effective global batch size (this is what you had originally)
     args.effective_batch_size = args.batch_size * args.world_size * args.accum_iter
-    # Use your fixed LR (kept as you had it)
-    args.lr = 1.6e-4
-    print(f'Effective batch size: {args.effective_batch_size}  lr_base={args.lr_base}  lr={args.lr}  '
-          f'max_epochs={args.max_epochs}  max_steps={args.max_steps}')
+
+    # Linear LR scaling w.r.t. effective batch size (ref = 8)
+    args.lr = (args.lr_base * args.effective_batch_size) / 8.0
+
+    # Warmup steps (if you use warmup_p)
+    args.warmup_steps = int(getattr(args, "warmup_p", 0.0) * args.max_steps)
+
+    print(
+        f'Effective batch size: {args.effective_batch_size} '
+        f'lr_base={args.lr_base} lr={args.lr} '
+        f'max_epochs={args.max_epochs} max_steps={args.max_steps}'
+    )
     return args
 
 def build_trainer(args):
