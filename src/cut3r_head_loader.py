@@ -4,7 +4,7 @@ from pathlib import Path
 # from your ported file:
 # from your_heads_file import DPTPts3dPose, PixelwiseTaskWithDPT
 import sys
-sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
+sys.path.append("/workspace/CUT3R/src")
 from dust3r.heads.dpt_head import DPTPts3dPose, PixelwiseTaskWithDPT
 
 class _NetLike:
@@ -56,7 +56,7 @@ def load_exported_head(export_dir):
 
 
 if __name__ == "__main__":
-    head, meta = load_exported_head("/workspace/cut3r-forecasting/cut3r/src/exported_cut3r_head")
+    head, meta = load_exported_head("/home/jevers/CUT3R/exported_cut3r_head")
 
     # Test if forward pass runs through
     l0 = torch.randn(1, 196, 1024)

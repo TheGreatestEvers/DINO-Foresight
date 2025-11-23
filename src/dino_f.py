@@ -20,7 +20,7 @@ from dpt import DPTHead
 import timm
 import torch.nn.functional as F
 
-sys.path.append("/workspace/CUT3R/eval")
+sys.path.append("/workspace/CUT3R")
 from eval.video_depth.tools import depth_evaluation
 
 
@@ -54,9 +54,16 @@ class Dino_f(pl.LightningModule):
 
             # 3d head for eval
             from src.cut3r_head_loader import load_exported_head
-            self.head, head_meta = load_exported_head("/workspace/cut3r-forecasting/cut3r/src/exported_cut3r_head")
+            self.head, head_meta = load_exported_head("/workspace/CUT3R/exported_cut3r_head")
             self.head_img_hw = (224,224)
             self._do_eval3d_this_epoch = False
+
+            self.context_len = 4                        # frames 0..3
+            self.target_t    = self.sequence_length - 1 # 4 (5th frame)
+            self.unroll_steps = getattr(args, "unroll_steps", 3)
+
+            # horizon frame index (in the original 7-frame GT sequence) for midterm eval
+            self.horizon_idx_unroll = self.context_len - 1 + self.unroll_steps  # 3 + 3 = 6
 
         else:
             pass
@@ -69,10 +76,11 @@ class Dino_f(pl.LightningModule):
             self.mean = torch.nn.Parameter(torch.tensor(self.pca_dict['mean']), requires_grad=False)
             self.std = torch.nn.Parameter(torch.tensor(self.pca_dict['std']),requires_grad=False)
             self.embedding_dim = self.pca_components.shape[0] 
-            self.maskvit = MaskTransformer(shape=self.shape, embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim, depth=self.layers,
-                                       heads=self.heads, mlp_dim=4*self.hidden_dim, dropout=self.dropout,use_fc_bias=args.use_fc_bias,
-                                       seperable_attention=args.seperable_attention,seperable_window_size=args.seperable_window_size, use_first_last=args.use_first_last)
-            self.train_mask_frames = args.train_mask_frames
+            
+        self.maskvit = MaskTransformer(shape=self.shape, embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim, depth=self.layers,
+                                    heads=self.heads, mlp_dim=4*self.hidden_dim, dropout=self.dropout,use_fc_bias=args.use_fc_bias,
+                                    seperable_attention=args.seperable_attention,seperable_window_size=args.seperable_window_size, use_first_last=args.use_first_last)
+        self.train_mask_frames = args.train_mask_frames
         self.train_mask_mode = args.train_mask_mode
         self.masking = args.masking
         assert self.masking in ("half_half", "simple_replace", "half_half_previous")
@@ -283,38 +291,54 @@ class Dino_f(pl.LightningModule):
     def preprocess(self, x):
         """
         External mode:
-        Accepts any of:
-            [B, T, H, W, C]  (preferred)
-            [B, T, C, H, W]  (will permute to [B,T,H,W,C])
-            [B, T, HW, C]    (will reshape to [B,T,H,W,C] using args.feat_hw)
-        Returns [B, T, H, W, C] in the (optional) PCA space if pca_ckpt is provided.
+            x: [B, T, Hf*Wf+1, C]  (pose token + grid tokens)
+        Non-external mode:
+            x: [B, T, C, H, W]
+
+        Always returns: x of shape [B, sequence_length, Hf, Wf, C_pca?]
         """
-        pose_tokens = None
         if self.args.feature_extractor == 'external':
-            if x.dim() == 4 and x.shape[-1] == self.args.cached_feature_dim:
-                # [B,T,HW,C] -> [B,T,H,W,C]
-                B, T, HW, C = x.shape
-
-                Hf, Wf = self.args.feat_hw
-                x = x.view(B, T, Hf, Wf, C)
-            else:
+            # x: [B, T, S, C] with S = Hf*Wf+1 (pose + grid)
+            if x.dim() != 4:
                 raise ValueError(f"Unsupported external feature shape: {tuple(x.shape)}")
+            B, T, S, C = x.shape
+            Hf, Wf = self.args.feat_hw
+            assert S == Hf * Wf + 1, f"Expected S = Hf*Wf+1 = {Hf*Wf+1}, got {S}"
 
+            # --- correct pose-token filtering ---
+            # pose_tokens = x[:, :, 0:1, :]   # keep if you ever need them
+            x = x[:, :, 1:, :]               # drop pose token -> [B, T, Hf*Wf, C]
+
+            # enforce model sequence length (5) on time dimension
+            assert T >= self.sequence_length, f"Got T={T}, need at least {self.sequence_length}"
+            x = x[:, :self.sequence_length]  # [B, seq_len, Hf*Wf, C]
+
+            # reshape tokens to grid
+            x = x.view(B, self.sequence_length, Hf, Wf, C)  # [B, seq_len, Hf, Wf, C]
+
+            # optional PCA
             if self.args.pca_ckpt:
-                B, T, H, W, C = x.shape
-                x = x.view(B*T, H*W, C)
-                x = self.pca_transform(x)  # token-wise PCA
-                x = x.view(B, T, H, W, -1)
-            return x, pose_tokens
+                B_, T_, H, W, C_ = x.shape
+                x = x.view(B_ * T_, H * W, C_)
+                x = self.pca_transform(x)
+                x = x.view(B_, T_, H, W, -1)
 
-        # -------- original image-encoder path (kept intact if you still want it) --------
+            return x
+
+        # ---------------- non-external path unchanged (just enforce seq_len) ----------------
         B, T, C, H, W = x.shape
-        x = x.flatten(end_dim=1)  # [B*T,C,H,W]
-        x = self.extract_features(x)  # [B*T, H*W, C]
+        assert T >= self.sequence_length
+        x = x[:, :self.sequence_length]
+
+        x = x.flatten(end_dim=1)  # [B*seq_len, C, H, W]
+        x = self.extract_features(x)  # [B*seq_len, Hf*Wf, C_raw]
         if self.args.pca_ckpt:
             x = self.pca_transform(x)
-        x = einops.rearrange(x, 'b (h w) c -> b h w c', h=H//self.patch_size, w=W//self.patch_size)
-        x = x.unflatten(dim=0, sizes=(B, self.sequence_length))  # [B,T,H,W,C]
+        x = einops.rearrange(
+            x, 'b (h w) c -> b h w c',
+            h=H // self.patch_size, w=W // self.patch_size
+        )
+        x = x.unflatten(dim=0, sizes=(B, self.sequence_length))
         return x
 
     def postprocess(self, x):
@@ -382,44 +406,85 @@ class Dino_f(pl.LightningModule):
             return prediction, loss
             # return prediction, loss, final_tokens
 
-    def sample_unroll(self, x, gt_feats, sched_mode="arccos", step=15, mask_frames=1, unroll_steps=3, ):
+    def sample_unroll(self, x, gt_feats, sched_mode="arccos", step=15, mask_frames=1, unroll_steps=3):
+        """
+        Autoregressive rollout:
+
+        x:      raw input features (same as training_step), with at least sequence_length frames.
+        gt_feats: GT features for the horizon frame you care about (e.g. feats[:, 6]).
+
+        We:
+        - preprocess to a sequence of length sequence_length (5),
+        - run unroll_steps iterations:
+            each iteration masks the last frame, predicts it, writes prediction back in,
+            then shifts the sequence so the prediction becomes part of the context,
+        - postprocess and compute loss on the final last frame vs gt_feats.
+        """
         self.maskvit.eval()
         with torch.no_grad():
-            x = self.preprocess(x)
+            # This uses your new preprocess which slices to sequence_length
+            x = self.preprocess(x)  # [B, seq_len, H, W, C]
         B, SL, H, W, C = x.shape
+        assert SL == self.sequence_length, f"Expected seq_len {self.sequence_length}, got {SL}"
+
         for i in range(unroll_steps):
             if not self.args.sliding_window_inference:
-                masked_soft_tokens, mask = self.get_mask_tokens(x, mode="full_mask",mask_frames=mask_frames)
+                # Mask ONLY the last frame (full_mask on that frame)
+                masked_soft_tokens, mask = self.get_mask_tokens(
+                    x, mode="full_mask", mask_frames=mask_frames
+                )
                 mask = mask.to(x.device)
-                if self.args.single_step_sample_train or step==1:
+
+                if self.args.single_step_sample_train or step == 1:
                     if self.args.vis_attn:
                         _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
                     else:
-                        loss, final_tokens= self.forward(x, masked_soft_tokens, mask)
+                        loss_step, final_tokens = self.forward(x, masked_soft_tokens, mask)
                 else:
-                    assert "Not implemented"
-                # x = self.postprocess(final_tokens)
+                    assert False, "Multi-step sched_mode not implemented for unroll"
+
+                # Overwrite the last frame in-place with the prediction
+                x[:, -1] = final_tokens[:, -1]
+
+                # Slide window: drop first, append predicted last as new last context+target
+                x = torch.cat((x[:, 1:], x[:, -1:].clone()), dim=1)
+
             else:
-                window_size = (16,32)
-                stride = (16,32)
+                # Only if you actually need sliding_window_inference here.
+                window_size = (16, 32)
+                stride = (16, 32)
                 x_s = self.sliding_window(x, window_size, stride)
                 wins = []
-                for i in range(x_s.shape[0]):
-                    win = x_s[i]
-                    masked_soft_tokens, mask = self.get_mask_tokens(win, mode="full_mask",mask_frames=mask_frames)
+                for j in range(x_s.shape[0]):
+                    win = x_s[j]
+                    masked_soft_tokens, mask = self.get_mask_tokens(
+                        win, mode="full_mask", mask_frames=mask_frames
+                    )
                     mask = mask.to(x.device)
-                    if self.args.single_step_sample_train or step==1:
+                    if self.args.single_step_sample_train or step == 1:
                         if self.args.vis_attn:
-                            _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
+                            _, final_tokens, attn_weights = self.forward(win, masked_soft_tokens, mask)
                         else:
-                            loss, final_tokens_win = self.forward(win, masked_soft_tokens, mask)
+                            loss_step, final_tokens_win = self.forward(win, masked_soft_tokens, mask)
                     wins.append(final_tokens_win)
-                final_tokens = self.merge_windows(torch.stack(wins), (B, SL, H, W, 1152), window_size, stride).to(x.device)
-            x[:,-1] = final_tokens[:,-1]
-            x = torch.cat((x[:,1:], x[:,-1].unsqueeze(1)), dim=1) # Mayve also try torch.zeros instead of x[:,-1]
-        prediction = self.postprocess(x)
-        loss = self.calculate_loss(prediction[:,-1].flatten(end_dim=-2), gt_feats.flatten(end_dim=-2))
-        # return prediction, loss, x
+
+                final_tokens = self.merge_windows(
+                    torch.stack(wins), (B, SL, H, W, final_tokens_win.shape[-1]),
+                    window_size, stride
+                ).to(x.device)
+
+                x[:, -1] = final_tokens[:, -1]
+                x = torch.cat((x[:, 1:], x[:, -1:].clone()), dim=1)
+
+        # After unroll, interpret the LAST frame as the horizon prediction
+        prediction = self.postprocess(x)      # back to original feature space
+        pred_horizon = prediction[:, -1]      # [B, H, W, C] at horizon
+
+        # gt_feats: [B, H, W, C] for the horizon frame (e.g. feats[:, 6] after reshape)
+        loss = self.calculate_loss(
+            pred_horizon.flatten(end_dim=-2),
+            gt_feats.flatten(end_dim=-2)
+        )
         return prediction, loss
 
     def forward(self, x, masked_x, mask=None):
@@ -440,7 +505,8 @@ class Dino_f(pl.LightningModule):
 
     def training_step(self, x, batch_idx):
         B = x.shape[0]
-        x, pose_tokens = self.preprocess(x)  # pose_tokens: [B,T,1,C] or None
+
+        x = self.preprocess(x)
 
         # Mask grid
         if self.args.crop_feats:
@@ -459,7 +525,9 @@ class Dino_f(pl.LightningModule):
             loss, _ = self.forward(x, masked_x, mask)
 
         # Logs
-        self.log("Train/loss", loss, batch_size=B, logger=True, on_step=True, prog_bar=True, rank_zero_only=True)
+        self.log("Train/loss", loss, batch_size=B, logger=True, on_step=True, prog_bar=True, rank_zero_only=True, sync_dist=True)
+        # epoch-aggregated train loss (nice and smooth curve)
+        self.log("Train/epoch_loss", loss, batch_size=B, logger=True, on_step=False, on_epoch=True, rank_zero_only=True, sync_dist=True)
         lr = self.optimizers().optimizer.param_groups[0]["lr"]
         self.log("Train/lr", lr, logger=True, on_step=True, prog_bar=True, rank_zero_only=True)
         mask_ratio = mask[:,-1].float().mean().item() * 100
@@ -478,42 +546,6 @@ class Dino_f(pl.LightningModule):
         self.ff_mae.update(mae)
         self.ff_cos.update(cos)
         return mse, mae, cos
-    
-    @torch.no_grad()
-    def _run_head_on_seq(self, feats_bt_hw_c: torch.Tensor, pose_tokens_bt_1_c: torch.Tensor | None,
-                        per_layer_dims: tuple[int,int,int,int] | None = (1024, 768, 768, 768)):
-        """
-        Run CUT3R head on EVERY frame. Inputs must already be in the head's feature space
-        (i.e., AFTER self.postprocess()).
-
-        Args:
-            feats_bt_hw_c: [B, T, Hf, Wf, C]
-            pose_tokens_bt_1_c: [B, T, 1, C] or None
-            per_layer_dims: channel split for the 4 layer-blobs concatenated in C
-
-        Returns:
-            outs: list of length T; each item has 'camera_pose': [B,7]
-        """
-        assert hasattr(self, "head") and (self.head is not None), "CUT3R head not loaded."
-        self.head.eval()
-
-        B, T, Hf, Wf, C = feats_bt_hw_c.shape
-        if pose_tokens_bt_1_c is None:
-            pose_tokens_bt_1_c = torch.zeros(B, T, 1, C, device=feats_bt_hw_c.device, dtype=feats_bt_hw_c.dtype)
-
-        # fall back to equal quarters if the provided split doesn't match C
-        if (per_layer_dims is None) or (sum(per_layer_dims) != C):
-            q = C // 4
-            per_layer_dims = (q, q, q, C - 3*q)
-
-        outs = []
-        for t in range(T):
-            x_t = feats_bt_hw_c[:, t]      # [B,Hf,Wf,C]
-            p_t = pose_tokens_bt_1_c[:, t] # [B,1,C]
-            head_in_t = self._create_head_input(x_t, p_t, per_layer_dims=per_layer_dims)
-            out_t = self.head(head_in_t, img_info=self.head_img_hw)
-            outs.append(out_t)
-        return outs
     
     def validation_step(self, batch, batch_idx):
         if self.args.eval_mode or self._do_eval3d_this_epoch:
@@ -543,70 +575,82 @@ class Dino_f(pl.LightningModule):
         self.mean_metric.update(total_loss)
         self.log('val/loss', total_loss, prog_bar=True, batch_size=B, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
-    def sample_baseline_copy_last(self, feats, gt_feats, last_context_idx=0):
-        # feats: [B, T, H*W+1, C]
-        # gt_feats: [B, 1, H*W+1, C]
-        x_pred = feats[:, last_context_idx].squeeze(1)
+    def sample_baseline_copy_last(self, feats, last_context_idx=None):
+        """
+        feats: [B, T, H*W+1, C] with T >= sequence_length (e.g. 7)
+        Returns:
+            samples: [B, sequence_length, H*W+1, C] with frame 4 predicted as copy-last
+            loss   : baseline loss at target_t
+        """
+        feats = self.preprocess(feats)
+        B, T, H, W, C = feats.shape
+        target_t = self.target_t               # 4
+        if last_context_idx is None:
+            last_context_idx = self.context_len - 1  # 3
 
-        x_gt = gt_feats[:, -1]
+        # copy last context frame
+        x_pred = feats[:, last_context_idx]          # [B, H, W, C]
+        x_gt   = feats[:, target_t]                  # [B, H, W, C]
 
         loss = self.calculate_loss(x_pred, x_gt)
 
-        # Return sequence with the last feature/pose being predicted with copy last
-        gt_feats[:, -1] = x_pred
+        # construct a sequence [0..4] with predicted frame at target_t
+        samples = feats[:, :self.sequence_length].clone()
+        samples[:, target_t] = x_pred
 
-        return gt_feats[:,:, 1:], loss  # Return grid, pose token, loss
+        return samples, loss
 
     def evaluation_step(self, batch, batch_idx):
-        feats, depth, pose = batch  # [B,T,H*W+1,C], [B,T,H,W], [B,T,4,4]
+        feats, depth, pose = batch  # feats: [B, 7, H*W+1, C] (for external), depth: [B, 7, H, W]
 
-        # --- Forecast samples (unchanged) ---
         if self.args.evaluate_baseline:
-            samples, loss = self.sample_baseline_copy_last(feats, gt_feats=feats.clone())
+            samples, loss = self.sample_baseline_copy_last(feats)
         else:
             if self.args.eval_midterm:
-                samples_grid, loss = self.sample_unroll(
-                    feats, gt_feats=feats[:, -1],
-                    sched_mode=self.train_mask_mode, step=self.args.step, unroll_steps=3
+                unroll_steps = getattr(self.args, "unroll_steps", self.unroll_steps)
+
+                # This is your midterm horizon index in the original 7-frame sequence
+                horizon_idx = self.horizon_idx_unroll  # 6 for context_len=4, unroll_steps=3
+
+                # You may need to reshape feats[:, horizon_idx] to [B, H, W, C] if it is [B, HW+1, C]
+                # For external features, that might look like:
+                B, T, HW_plus1, C = feats.shape
+                Hf, Wf = self.args.feat_hw
+                gt_feats_horizon = feats[:, horizon_idx, 1:]           # drop pose token
+                gt_feats_horizon = gt_feats_horizon.view(B, Hf, Wf, C) # [B,Hf,Wf,C]
+
+                samples, loss = self.sample_unroll(
+                    feats,                   # raw features sequence
+                    gt_feats=gt_feats_horizon,
+                    sched_mode=self.train_mask_mode,
+                    step=self.args.step,
+                    mask_frames=1,           # only last frame masked
+                    unroll_steps=unroll_steps,
                 )
             else:
-                samples_grid, loss = self.sample(
+                samples, loss = self.sample(
                     feats, sched_mode=self.train_mask_mode, step=self.args.step
                 )
 
-        # after obtaining loss from sample/sample_unroll/baseline
         B = feats.shape[0]
-        # keep a scalar tensor
         loss_val = loss if torch.is_tensor(loss) else torch.tensor(loss, device=self.device, dtype=torch.float32)
-
-        # log per-epoch aggregation and update running mean so val/mean_loss is finite
         self.log('val/loss', loss_val, prog_bar=True, batch_size=B, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.mean_metric.update(loss_val.detach())
 
-        # ------------ Depth on TARGET ------------
-        pred_last = samples[:, -1]       # [B,Hf,Wf,4D]
-        per_layer_dims = (1024, 768, 768, 768)
+        # -------- Depth eval alignment --------
+        if self.args.eval_midterm:
+            horizon_idx = self.horizon_idx_unroll  # 6
+        else:
+            horizon_idx = self.target_t            # 4
 
-        head_in_tgt = self._create_head_input(pred_last, pose_pred_last, per_layer_dims=per_layer_dims)
+        pred_last = samples[:, -1]  # [B,Hf,Wf,C]
+        per_layer_dims = (1024, 768, 768, 768)
+        head_in_tgt = self._create_head_input(pred_last, per_layer_dims=per_layer_dims, add_dummy_pose_token_on_last=True)
         with torch.no_grad():
             head_out_tgt = self.head(head_in_tgt, img_info=self.head_img_hw)
-            
-        gt_depth_t = depth[:, -1].to(self.device)
+
+        gt_depth_t = depth[:, horizon_idx].to(self.device)
         self._update_depth_metrics_from_head(head_out_tgt, gt_depth_t)
-
-        # ------------ Pose metrics (GLOBAL Sim(3) over many frames) ------------
-        # Use the GT features for ALL frames, run head per frame, then swap-in the forecast for the last.
-        x_gt_hw = self.preprocess(feats)   # [B,T,Hf,Wf,C_pca], [B,T,1,C_pca] or None
-        x_gt_hw = self.postprocess(x_gt_hw)             # back to head feature space (for the head)
-
-        # run head on every frame to get per-frame camera_pose predictions
-        outs_all = self._run_head_on_seq(x_gt_hw, pose_tokens, per_layer_dims=per_layer_dims)  # list length T
-
-        # replace the last (target) with your actual forecast head output
-        outs_all[-1] = head_out_tgt
-
-        # use frames 0..T-1 for alignment (or pass use_until_idx=t for causal-at-t)
-        #self._update_pose_metrics_global()
 
     def on_validation_epoch_start(self):
         n = getattr(self.args, "eval3d_every_n_epochs", 0) or 0
@@ -647,50 +691,83 @@ class Dino_f(pl.LightningModule):
 
         self.log_dict(logs, prog_bar=True, logger=True)
             
-    def configure_optimizers(self):
+    """def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr, betas=(0.9, 0.999))
         assert hasattr(self.args, 'max_steps') and self.args.max_steps is not None, f"Must set max_steps argument"
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args.max_steps)
-        return [optimizer], [dict(scheduler=scheduler, interval='step', frequency=1)]
+        return [optimizer], [dict(scheduler=scheduler, interval='step', frequency=1)]"""
 
-    def _create_head_input(self, x_last: torch.Tensor, pose_last:torch.Tensor, per_layer_dims=None, add_dummy_pose_token_on_last=False):
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.args.lr,
+            betas=(0.9, 0.999)
+        )
+
+        assert hasattr(self.args, 'max_steps') and self.args.max_steps is not None, \
+            "Must set max_steps argument via scale_and_set_lr_args"
+
+        warmup_steps = getattr(self.args, "warmup_steps", 0)
+        max_steps   = self.args.max_steps
+
+        if warmup_steps > 0:
+            def lr_lambda(current_step: int):
+                # 1) warmup phase: linear from 0 -> 1
+                if current_step < warmup_steps:
+                    return float(current_step + 1) / float(max(1, warmup_steps))
+
+                # 2) cosine decay phase: 1 -> 0
+                progress = float(current_step - warmup_steps) / float(
+                    max(1, max_steps - warmup_steps)
+                )
+                # standard cosine from 1 to 0
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            # pure cosine over all steps
+            def lr_lambda(current_step: int):
+                progress = float(current_step) / float(max(1, max_steps))
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        return [optimizer], [dict(scheduler=scheduler,
+                                interval='step',
+                                frequency=1)]
+
+    def _create_head_input(self, x_last: torch.Tensor, per_layer_dims=None, add_dummy_pose_token_on_last=False):
         """
-        x_last: [B, Hf, Wf, 4D] or [B, S, 4D]
-        per_layer_dims: optional (d0, d1, d2, d3). If None, we infer equal quarters.
-        Returns: [l0, l1, l2, l3] each [B, S, d_i] (and we can append a CLS to l3).
+        x_last: [B, Hf, Wf, C] or [B, S, C]
+        Returns: [l0, l1, l2, l3], each [B, S, d_i]
+        Optionally prepends a dummy pose token on the last layer.
         """
         if x_last.dim() == 4:  # [B,Hf,Wf,C]
             B, Hf, Wf, C = x_last.shape
             S = Hf * Wf
             x_flat = x_last.view(B, S, C)
         elif x_last.dim() == 3:  # [B,S,C]
-            B, S, C = x_last.shape
             x_flat = x_last
+            B, S, C = x_flat.shape
         else:
             raise ValueError(f"Unexpected feat shape {tuple(x_last.shape)}")
 
-        
-        d0, d1, d2, d3 = per_layer_dims
-        assert d0 + d1 + d2 + d3 == C, f"Channel split mismatch: {C=} vs {d0,d1,d2,d3}"
+        if per_layer_dims is None:
+            q = C // 4
+            per_layer_dims = (q, q, q, C - 3*q)
 
-        # Layer features
+        d0, d1, d2, d3 = per_layer_dims
+        assert d0 + d1 + d2 + d3 == C
+
         l0 = x_flat[:, :, 0:d0]
         l1 = x_flat[:, :, d0:d0+d1]
         l2 = x_flat[:, :, d0+d1:d0+d1+d2]
         l3 = x_flat[:, :, d0+d1+d2:d0+d1+d2+d3]
 
-        # Pose token
-        p3 = pose_last[:, :, d0+d1+d2:d0+d1+d2+d3]
-
         if add_dummy_pose_token_on_last:
-            # prepend a dummy pose token to the last layer -> [B, S+1, d3]
-            dummy_pose_token = torch.zeros(l3.size(0), 1, l3.size(2), device=l3.device, dtype=l3.dtype)
+            dummy_pose_token = torch.zeros(B, 1, d3, device=l3.device, dtype=l3.dtype)
             l3 = torch.cat([dummy_pose_token, l3], dim=1)
-        else:
-            l3 = torch.cat([p3, l3], dim=1)
+
         return [l0, l1, l2, l3]
 
-    @torch.no_grad()
     def _update_depth_metrics_from_head(self, head_out, gt_depth_t):
         """
         Per-sequence depth eval using the original depth_evaluation(), with:
@@ -698,6 +775,8 @@ class Dino_f(pl.LightningModule):
         - pixel-weighted aggregation over sequences
         - local grad enable for LAD2 optimization (s, t) only
         """
+        #torch.set_grad_enable(True)
+
         if head_out is None or gt_depth_t is None:
             return
 

@@ -8,7 +8,8 @@ import glob
 from torch.utils.data import DataLoader, Subset
 import torch
 
-from src.dino_f import Dino_f  # your modified class that supports feature_extractor='external'
+from src.dino_f import Dino_f  
+from src.data_waymo import SelectedFusedImgFeatConcatDataset
 
 DEBUG = False
 
@@ -57,9 +58,6 @@ def collate_fused_view(batch):
 
 if not DEBUG:
     def make_loaders(args):
-        import sys
-        sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
-        from data_dino_foresight import SelectedFusedImgFeatConcatDataset
 
         g = torch.Generator().manual_seed(42)
 
@@ -79,52 +77,47 @@ if not DEBUG:
 
         return train_loader, val_loader
 else:
+    # For debugging
+    def make_loaders(args):
 
+            g = torch.Generator().manual_seed(42)
 
-# For debugging
-def make_loaders(args):
-        import sys
-        sys.path.append("/workspace/cut3r-forecasting/cut3r/src")
-        from data_dino_foresight import SelectedFusedImgFeatConcatDataset
+            # -------------------------------
+            # DEBUG MODE: use the SAME items for train and val
+            # - Train: feats only (return_view=False)
+            # - Val  : feats + (depth, pose) (return_view=True)
+            # We pick items from a single root (val path by default) so
+            # indices match exactly across the two dataset instances.
+            # -------------------------------
 
-        g = torch.Generator().manual_seed(42)
+            # choose which root to pull from for both
+            root = args.val_features_path  # or args.train_features_path
 
-        # -------------------------------
-        # DEBUG MODE: use the SAME items for train and val
-        # - Train: feats only (return_view=False)
-        # - Val  : feats + (depth, pose) (return_view=True)
-        # We pick items from a single root (val path by default) so
-        # indices match exactly across the two dataset instances.
-        # -------------------------------
+            # one dataset instance to derive the indices deterministically
+            base_ds = SelectedFusedImgFeatConcatDataset(root, return_view=False)
+            n = min(len(base_ds), int(getattr(args, "debug_num_samples", 4)))
+            idx = torch.arange(n).tolist()  # first N samples; or torch.randperm for random
 
-        # choose which root to pull from for both
-        root = args.val_features_path  # or args.train_features_path
+            # build train/val with identical indices but different return_view
+            train_ds = Subset(
+                SelectedFusedImgFeatConcatDataset(root, return_view=False), idx
+            )
+            val_ds = Subset(
+                SelectedFusedImgFeatConcatDataset(root, return_view=True), idx
+            )
 
-        # one dataset instance to derive the indices deterministically
-        base_ds = SelectedFusedImgFeatConcatDataset(root, return_view=False)
-        n = min(len(base_ds), int(getattr(args, "debug_num_samples", 16)))
-        idx = torch.arange(n).tolist()  # first N samples; or torch.randperm for random
-
-        # build train/val with identical indices but different return_view
-        train_ds = Subset(
-            SelectedFusedImgFeatConcatDataset(root, return_view=False), idx
-        )
-        val_ds = Subset(
-            SelectedFusedImgFeatConcatDataset(root, return_view=True), idx
-        )
-
-        train_loader = DataLoader(
-            train_ds, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True, drop_last=False,
-            collate_fn=collate_fused_view
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=args.batch_size, shuffle=False,
-            num_workers=getattr(args, "num_workers_val", None) or args.num_workers,
-            pin_memory=True, drop_last=False,       # keep complete eval set
-            collate_fn=collate_fused_view
-        )
-        return train_loader, val_loader
+            train_loader = DataLoader(
+                train_ds, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=False,
+                collate_fn=collate_fused_view
+            )
+            val_loader = DataLoader(
+                val_ds, batch_size=args.batch_size, shuffle=False,
+                num_workers=getattr(args, "num_workers_val", None) or args.num_workers,
+                pin_memory=True, drop_last=False,       # keep complete eval set
+                collate_fn=collate_fused_view
+            )
+            return train_loader, val_loader
 
 
 # --------------------------------------------------------------------------
@@ -136,15 +129,15 @@ def build_argparser():
     p = argparse.ArgumentParser()
 
     # Data / features
-    p.add_argument('--train_features_path', type=str, default="/workspace/waymo/training_fused_img_feat_dino_foresight")
-    p.add_argument('--val_features_path',   type=str, default="/workspace/waymo/validation_fused_img_feat_dino_foresight")
+    p.add_argument('--train_features_path', type=str, default="/workspace/raid/jevers/cut3r_features/waymo/fused_img_tokens_224/train")
+    p.add_argument('--val_features_path',   type=str, default="/workspace/raid/jevers/cut3r_features/waymo/fused_img_tokens_224/validation")
     p.add_argument('--feat_hw', type=parse_tuple, default=(14,14))
     p.add_argument('--cached_feature_dim', type=int, default=3328)
 
     # Sequence / loader
     p.add_argument('--sequence_length', type=int, default=5)
     p.add_argument('--batch_size', type=int, default=8)
-    p.add_argument('--num_workers', type=int, default=0)
+    p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--num_workers_val', type=int, default=None)
 
     # Masking / loss
@@ -202,7 +195,7 @@ def build_argparser():
     p.add_argument('--depth_post_clip_max', type=float, default=70.0)
 
     # 3D / pose eval cadence
-    p.add_argument('--eval3d_every_n_epochs', type=int, default=200 if not DEBUG else 1)
+    p.add_argument('--eval3d_every_n_epochs', type=int, default=5 if not DEBUG else 1)
     p.add_argument('--step', type=int, default=1)
     p.add_argument('--eval_midterm', action='store_true', default=False)
     p.add_argument('--evaluate_baseline', action='store_true', default=False)
@@ -230,6 +223,7 @@ def setup_args_defaults(args):
 
     args.eval_ckpt_only = False
     args.ckpt = None
+    args.warmup_p = 0.04
     
     args.eval_mode = False  # will flip to True when evaluating
     return args
@@ -285,7 +279,8 @@ def scale_and_set_lr_args(args, steps_per_epoch):
     args.effective_batch_size = args.batch_size * args.world_size * args.accum_iter
 
     # Linear LR scaling w.r.t. effective batch size (ref = 8)
-    args.lr = (args.lr_base * args.effective_batch_size) / 8.0
+    #args.lr = (args.lr_base * args.effective_batch_size) / 8.0
+    args.lr = 1.6e-4
 
     # Warmup steps (if you use warmup_p)
     args.warmup_steps = int(getattr(args, "warmup_p", 0.0) * args.max_steps)
@@ -315,17 +310,18 @@ def build_trainer(args):
 
     trainer = pl.Trainer(
         accelerator='gpu',
-        strategy=(DDPStrategy(find_unused_parameters=False) if args.num_gpus > 1 else 'auto'),
+        strategy=(DDPStrategy(find_unused_parameters=True) if args.num_gpus > 1 else 'auto'),
         devices=args.num_gpus,
         callbacks=[ckpt_cb, lr_cb],
         max_epochs=args.max_epochs,
         gradient_clip_val=args.gclip,
         default_root_dir=args.dst_path,
         precision=normalize_precision_arg(args.precision),
-        log_every_n_steps=5,
+        log_every_n_steps=1,
         check_val_every_n_epoch=args.eval_freq,
         accumulate_grad_batches=args.accum_iter,
-        logger=tb_logger
+        logger=tb_logger,
+        inference_mode=False
     )
     print(f"TensorBoard logdir: {tb_logger.log_dir}")
     return trainer, tb_logger, ckpt_cb
