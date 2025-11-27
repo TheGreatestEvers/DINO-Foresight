@@ -56,7 +56,7 @@ def load_exported_head(export_dir):
 
 
 if __name__ == "__main__":
-    head, meta = load_exported_head("/home/jevers/CUT3R/exported_cut3r_head")
+    head, meta = load_exported_head("/workspace/CUT3R/exported_cut3r_head")
 
     # Test if forward pass runs through
     l0 = torch.randn(1, 196, 1024)

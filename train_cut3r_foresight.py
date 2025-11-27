@@ -133,6 +133,8 @@ def build_argparser():
     p.add_argument('--val_features_path',   type=str, default="/workspace/raid/jevers/cut3r_features/waymo/fused_img_tokens_224/validation")
     p.add_argument('--feat_hw', type=parse_tuple, default=(14,14))
     p.add_argument('--cached_feature_dim', type=int, default=3328)
+    p.add_argument('--pose_token_mode', action='store_true', default=False)
+    
 
     # Sequence / loader
     p.add_argument('--sequence_length', type=int, default=5)
@@ -199,6 +201,7 @@ def build_argparser():
     p.add_argument('--step', type=int, default=1)
     p.add_argument('--eval_midterm', action='store_true', default=False)
     p.add_argument('--evaluate_baseline', action='store_true', default=False)
+    p.add_argument('--evaluate_oracle', action='store_true', default=False)
 
     return p
 
@@ -220,6 +223,8 @@ def setup_args_defaults(args):
     args.high_res_adapt = False
     args.single_step_sample_train = True
     # depth cfg already parsed above
+
+    args.pose_token_mode = True
 
     args.eval_ckpt_only = False
     args.ckpt = None
@@ -280,7 +285,7 @@ def scale_and_set_lr_args(args, steps_per_epoch):
 
     # Linear LR scaling w.r.t. effective batch size (ref = 8)
     #args.lr = (args.lr_base * args.effective_batch_size) / 8.0
-    args.lr = 1.6e-4
+    args.lr = 1.0e-4
 
     # Warmup steps (if you use warmup_p)
     args.warmup_steps = int(getattr(args, "warmup_p", 0.0) * args.max_steps)

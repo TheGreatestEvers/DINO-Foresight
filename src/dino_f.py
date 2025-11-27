@@ -49,7 +49,20 @@ class Dino_f(pl.LightningModule):
             self.d_num_layers = 1
             self.feature_dim = self.args.cached_feature_dim
             Hf, Wf = self.args.feat_hw
-            self.shape = (self.sequence_length, Hf, Wf)
+
+            # token-mode flag (default: False -> old behavior) ----
+            self.pose_token_mode = getattr(args, "pose_token_mode", False)
+
+            if self.pose_token_mode:
+                # 1D token mode: keep pose token + all spatial tokens
+                # Input features will be [B, T, S, C] with S = Hf*Wf + 1
+                S = Hf * Wf + 1
+                # shape = (T, H, W) = (T, 1, S) for MaskTransformer / AddBroadcastPosEmbed
+                self.shape = (self.sequence_length, 1, S)
+            else:
+                # ---- OLD behavior (grid, pose dropped) ----
+                self.shape = (self.sequence_length, Hf, Wf)
+
             self.embedding_dim = self.feature_dim
 
             # 3d head for eval
@@ -288,44 +301,66 @@ class Dino_f(pl.LightningModule):
         x = x * self.std + self.mean
         return x
 
-    def preprocess(self, x):
+    def preprocess(self, x, cut_to_sequence_len=True):
         """
         External mode:
             x: [B, T, Hf*Wf+1, C]  (pose token + grid tokens)
+
         Non-external mode:
             x: [B, T, C, H, W]
 
-        Always returns: x of shape [B, sequence_length, Hf, Wf, C_pca?]
+        Returns:
+            - grid mode (token_mode=False):
+                [B, sequence_length, Hf, Wf, C_pca?]  (pose dropped)
+            - token mode (token_mode=True):
+                [B, sequence_length, 1, S, C_pca?]    (pose + spatial tokens)
+                  with S = Hf*Wf + 1
         """
         if self.args.feature_extractor == 'external':
-            # x: [B, T, S, C] with S = Hf*Wf+1 (pose + grid)
             if x.dim() != 4:
                 raise ValueError(f"Unsupported external feature shape: {tuple(x.shape)}")
+
             B, T, S, C = x.shape
             Hf, Wf = self.args.feat_hw
-            assert S == Hf * Wf + 1, f"Expected S = Hf*Wf+1 = {Hf*Wf+1}, got {S}"
+            expected_S = Hf * Wf + 1
+            assert S == expected_S, f"Expected S = Hf*Wf+1 = {expected_S}, got {S}"
 
-            # --- correct pose-token filtering ---
-            # pose_tokens = x[:, :, 0:1, :]   # keep if you ever need them
-            x = x[:, :, 1:, :]               # drop pose token -> [B, T, Hf*Wf, C]
-
-            # enforce model sequence length (5) on time dimension
+            # Enforce model sequence length on time dimension
             assert T >= self.sequence_length, f"Got T={T}, need at least {self.sequence_length}"
-            x = x[:, :self.sequence_length]  # [B, seq_len, Hf*Wf, C]
+            if cut_to_sequence_len:
+                x = x[:, :self.sequence_length]
+                T = self.sequence_length
 
-            # reshape tokens to grid
-            x = x.view(B, self.sequence_length, Hf, Wf, C)  # [B, seq_len, Hf, Wf, C]
+            # ---- NEW: 1D token mode ----
+            if getattr(self, "pose_token_mode", False):
+                # Keep pose token and all spatial tokens as 1D seq per frame: [B, T, S, C]
+                if self.args.pca_ckpt:
+                    # treat S as “HW” for PCA
+                    x_flat = x.view(B * T, S, C)           # [B*T, S, C]
+                    x_flat = self.pca_transform(x_flat)    # [B*T, S, C_pca]
+                    C_pca = x_flat.shape[-1]
+                    x = x_flat.view(B, T, S, C_pca)        # [B, T, S, C_pca]
+                # Add dummy spatial dimension: H=1, W=S
+                x = x.view(B, T, 1, S, x.shape[-1])        # [B, T, 1, S, C_pca]
+                return x
 
-            # optional PCA
+            # ---- OLD grid behavior (pose dropped) ----
+            # x: [B, T, Hf*Wf+1, C] -> drop pose token
+            x = x[:, :, 1:, :]               # [B, T, Hf*Wf, C]
+
+            # reshape tokens to grid: [B, T, Hf, Wf, C]
+            x = x.view(B, T, Hf, Wf, C)
+
+            # optional PCA (treat H*W as sequence dimension)
             if self.args.pca_ckpt:
                 B_, T_, H, W, C_ = x.shape
-                x = x.view(B_ * T_, H * W, C_)
-                x = self.pca_transform(x)
-                x = x.view(B_, T_, H, W, -1)
+                x_flat = x.view(B_ * T_, H * W, C_)
+                x_flat = self.pca_transform(x_flat)        # [B*T, H*W, C_pca]
+                x = x_flat.view(B_, T_, H, W, -1)          # [B, T, H, W, C_pca]
 
             return x
 
-        # ---------------- non-external path unchanged (just enforce seq_len) ----------------
+        # ---------------- non-external path unchanged ----------------
         B, T, C, H, W = x.shape
         assert T >= self.sequence_length
         x = x[:, :self.sequence_length]
@@ -548,7 +583,7 @@ class Dino_f(pl.LightningModule):
         return mse, mae, cos
     
     def validation_step(self, batch, batch_idx):
-        if self.args.eval_mode or self._do_eval3d_this_epoch:
+        if self.args.eval_mode: #or self._do_eval3d_this_epoch:
             return self.evaluation_step(batch, batch_idx)
         
         if isinstance(batch, torch.Tensor):
@@ -575,16 +610,17 @@ class Dino_f(pl.LightningModule):
         self.mean_metric.update(total_loss)
         self.log('val/loss', total_loss, prog_bar=True, batch_size=B, on_step=False, on_epoch=True, logger=True, sync_dist=True)
 
-    def sample_baseline_copy_last(self, feats, last_context_idx=None):
+    def sample_baseline_copy_last(self, feats, last_context_idx=None, target_t=None):
         """
         feats: [B, T, H*W+1, C] with T >= sequence_length (e.g. 7)
         Returns:
             samples: [B, sequence_length, H*W+1, C] with frame 4 predicted as copy-last
             loss   : baseline loss at target_t
         """
-        feats = self.preprocess(feats)
+        feats = self.preprocess(feats, cut_to_sequence_len=False)
         B, T, H, W, C = feats.shape
-        target_t = self.target_t               # 4
+        if target_t is None:
+            target_t = self.target_t               # 4
         if last_context_idx is None:
             last_context_idx = self.context_len - 1  # 3
 
@@ -596,7 +632,7 @@ class Dino_f(pl.LightningModule):
 
         # construct a sequence [0..4] with predicted frame at target_t
         samples = feats[:, :self.sequence_length].clone()
-        samples[:, target_t] = x_pred
+        samples[:, -1] = x_pred
 
         return samples, loss
 
@@ -604,7 +640,13 @@ class Dino_f(pl.LightningModule):
         feats, depth, pose = batch  # feats: [B, 7, H*W+1, C] (for external), depth: [B, 7, H, W]
 
         if self.args.evaluate_baseline:
-            samples, loss = self.sample_baseline_copy_last(feats)
+            if self.args.eval_midterm:
+                samples, loss = self.sample_baseline_copy_last(feats, target_t=6)
+            else:
+                samples, loss = self.sample_baseline_copy_last(feats)
+        elif self.args.evaluate_oracle:
+            samples = self.preprocess(feats)
+            loss = torch.tensor(0, device=self.device)
         else:
             if self.args.eval_midterm:
                 unroll_steps = getattr(self.args, "unroll_steps", self.unroll_steps)
@@ -691,13 +733,13 @@ class Dino_f(pl.LightningModule):
 
         self.log_dict(logs, prog_bar=True, logger=True)
             
-    """def configure_optimizers(self):
+    def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.args.lr, betas=(0.9, 0.999))
         assert hasattr(self.args, 'max_steps') and self.args.max_steps is not None, f"Must set max_steps argument"
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args.max_steps)
-        return [optimizer], [dict(scheduler=scheduler, interval='step', frequency=1)]"""
+        return [optimizer], [dict(scheduler=scheduler, interval='step', frequency=1)]
 
-    def configure_optimizers(self):
+    """def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.parameters(),
             lr=self.args.lr,
@@ -732,7 +774,7 @@ class Dino_f(pl.LightningModule):
 
         return [optimizer], [dict(scheduler=scheduler,
                                 interval='step',
-                                frequency=1)]
+                                frequency=1)]"""
 
     def _create_head_input(self, x_last: torch.Tensor, per_layer_dims=None, add_dummy_pose_token_on_last=False):
         """
