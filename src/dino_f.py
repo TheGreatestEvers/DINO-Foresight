@@ -22,6 +22,8 @@ import torch.nn.functional as F
 
 sys.path.append("/workspace/CUT3R")
 from eval.video_depth.tools import depth_evaluation
+from eval.relpose.evo_utils import eval_metrics
+from eval.relpose.utils import c2w_to_tumpose
 
 
 class Dino_f(pl.LightningModule):
@@ -72,6 +74,7 @@ class Dino_f(pl.LightningModule):
             self._do_eval3d_this_epoch = False
 
             self.context_len = 4                        # frames 0..3
+            self.last_context_idx = 3
             self.target_t    = self.sequence_length - 1 # 4 (5th frame)
             self.unroll_steps = getattr(args, "unroll_steps", 3)
 
@@ -123,9 +126,9 @@ class Dino_f(pl.LightningModule):
         self.depth_delta1_m = MeanMetric()
 
         # pose metrics
-        #self.pose_ate_m = MeanMetric()
-        #self.pose_rpe_t_m = MeanMetric()
-        #self.pose_rpe_r_m = MeanMetric()
+        self.pose_ate_m = MeanMetric()
+        self.pose_rpe_t_m = MeanMetric()
+        self.pose_rpe_r_m = MeanMetric()
 
         self.batch_crops = []
         self.random_crop = T.RandomCrop(16,32)
@@ -443,73 +446,83 @@ class Dino_f(pl.LightningModule):
 
     def sample_unroll(self, x, gt_feats, sched_mode="arccos", step=15, mask_frames=1, unroll_steps=3):
         """
-        Autoregressive rollout:
+        Autoregressive rollout that returns a full sequence of
+        [context_len + unroll_steps] frames.
 
-        x:      raw input features (same as training_step), with at least sequence_length frames.
-        gt_feats: GT features for the horizon frame you care about (e.g. feats[:, 6]).
+        x:        raw input features (same as training_step), with at least sequence_length frames.
+        gt_feats: GT features for the horizon frame (e.g. feats[:, 6] reshaped to [B, Hf, Wf, C]).
 
-        We:
-        - preprocess to a sequence of length sequence_length (5),
-        - run unroll_steps iterations:
-            each iteration masks the last frame, predicts it, writes prediction back in,
-            then shifts the sequence so the prediction becomes part of the context,
-        - postprocess and compute loss on the final last frame vs gt_feats.
+        Returns:
+            prediction: [B, context_len + unroll_steps, H, W, C]  (e.g. [B,7,H,W,C])
+                        frames 0..context_len-1     : GT context (preprocessed)
+                        frames context_len..end     : unrolled predictions
+            loss:       loss on the final horizon frame vs gt_feats
         """
         self.maskvit.eval()
         with torch.no_grad():
-            # This uses your new preprocess which slices to sequence_length
+            # Preprocess to model sequence_length (e.g. 5 frames)
             x = self.preprocess(x)  # [B, seq_len, H, W, C]
+
         B, SL, H, W, C = x.shape
         assert SL == self.sequence_length, f"Expected seq_len {self.sequence_length}, got {SL}"
 
+        # Rolling window used for autoregressive prediction (keeps model contract the same as before)
+        x_window = x.clone()  # [B, seq_len, H, W, C]
+
+        # Fixed context frames (0..context_len-1) from the original sequence
+        context_feats = x[:, :self.context_len].clone()  # [B, context_len, H, W, C]
+
+        # Store predicted frames for each unroll step (still in feature/PCA space)
+        pred_steps = []
+
         for i in range(unroll_steps):
             if not self.args.sliding_window_inference:
-                # Mask ONLY the last frame (full_mask on that frame)
+                # Mask ONLY the last frame in the current window
                 masked_soft_tokens, mask = self.get_mask_tokens(
-                    x, mode="full_mask", mask_frames=mask_frames
+                    x_window, mode="full_mask", mask_frames=mask_frames
                 )
-                mask = mask.to(x.device)
+                mask = mask.to(x_window.device)
 
                 if self.args.single_step_sample_train or step == 1:
                     if self.args.vis_attn:
-                        _, final_tokens, attn_weights = self.forward(x, masked_soft_tokens, mask)
+                        _, final_tokens, attn_weights = self.forward(x_window, masked_soft_tokens, mask)
                     else:
-                        loss_step, final_tokens = self.forward(x, masked_soft_tokens, mask)
+                        loss_step, final_tokens = self.forward(x_window, masked_soft_tokens, mask)
                 else:
-                    assert False, "Multi-step sched_mode not implemented for unroll"
+                    raise NotImplementedError("Multi-step sched_mode not implemented for unroll")
 
-                # Overwrite the last frame in-place with the prediction
-                x[:, -1] = final_tokens[:, -1]
+                # Last frame prediction in feature space
+                last_pred = final_tokens[:, -1].clone()  # [B,H,W,C]
+                pred_steps.append(last_pred)
 
-                # Slide window: drop first, append predicted last as new last context+target
-                x = torch.cat((x[:, 1:], x[:, -1:].clone()), dim=1)
+                # Update rolling window: overwrite last, then slide
+                x_window[:, -1] = last_pred
+                x_window = torch.cat(
+                    (x_window[:, 1:], x_window[:, -1:].clone()),
+                    dim=1
+                )  # still [B, seq_len, H, W, C]
 
             else:
-                # Only if you actually need sliding_window_inference here.
-                window_size = (16, 32)
-                stride = (16, 32)
-                x_s = self.sliding_window(x, window_size, stride)
-                wins = []
-                for j in range(x_s.shape[0]):
-                    win = x_s[j]
-                    masked_soft_tokens, mask = self.get_mask_tokens(
-                        win, mode="full_mask", mask_frames=mask_frames
-                    )
-                    mask = mask.to(x.device)
-                    if self.args.single_step_sample_train or step == 1:
-                        if self.args.vis_attn:
-                            _, final_tokens, attn_weights = self.forward(win, masked_soft_tokens, mask)
-                        else:
-                            loss_step, final_tokens_win = self.forward(win, masked_soft_tokens, mask)
-                    wins.append(final_tokens_win)
+                raise NotImplementedError("unroll + sliding_window_inference not supported for now")
 
-                final_tokens = self.merge_windows(
-                    torch.stack(wins), (B, SL, H, W, final_tokens_win.shape[-1]),
-                    window_size, stride
-                ).to(x.device)
+        # Stack predicted frames and build full sequence:
+        # [B, context_len + unroll_steps, H, W, C] -> e.g. [B,7,H,W,C]
+        pred_stack = torch.stack(pred_steps, dim=1)  # [B, unroll_steps, H, W, C]
+        x_full = torch.cat([context_feats, pred_stack], dim=1)
 
-                x[:, -1] = final_tokens[:, -1]
-                x = torch.cat((x[:, 1:], x[:, -1:].clone()), dim=1)
+        # Back to original feature space
+        prediction = self.postprocess(x_full)  # [B, context_len + unroll_steps, H, W, C]
+
+        # Horizon is the last frame in this sequence
+        pred_horizon = prediction[:, -1]  # [B, H, W, C]
+
+        # gt_feats is already [B, H, W, C] for the horizon (e.g. t=6)
+        loss = self.calculate_loss(
+            pred_horizon.flatten(end_dim=-2),
+            gt_feats.flatten(end_dim=-2)
+        )
+
+        return prediction, loss
 
         # After unroll, interpret the LAST frame as the horizon prediction
         prediction = self.postprocess(x)      # back to original feature space
@@ -612,27 +625,47 @@ class Dino_f(pl.LightningModule):
 
     def sample_baseline_copy_last(self, feats, last_context_idx=None, target_t=None):
         """
+        Baseline: copy the last context frame forward.
+
         feats: [B, T, H*W+1, C] with T >= sequence_length (e.g. 7)
+
         Returns:
-            samples: [B, sequence_length, H*W+1, C] with frame 4 predicted as copy-last
+            samples: [B, T_out, H, W, C]
+                     T_out = max(sequence_length, target_t+1)
+                     frames 0..last_context_idx     : GT context
+                     frames last_context_idx+1..end : copies of last context
             loss   : baseline loss at target_t
         """
-        feats = self.preprocess(feats, cut_to_sequence_len=False)
-        B, T, H, W, C = feats.shape
+        # get all frames (do NOT cut to sequence_length here)
+        feats_proc = self.preprocess(feats, cut_to_sequence_len=False)  # [B, T_all, H, W, C]
+        B, T_all, H, W, C = feats_proc.shape
+
         if target_t is None:
-            target_t = self.target_t               # 4
+            target_t = self.target_t                # 4 (short-term by default)
         if last_context_idx is None:
             last_context_idx = self.context_len - 1  # 3
 
-        # copy last context frame
-        x_pred = feats[:, last_context_idx]          # [B, H, W, C]
-        x_gt   = feats[:, target_t]                  # [B, H, W, C]
+        # Ensure we have enough frames
+        assert target_t < T_all, f"target_t={target_t} but feats only have T={T_all}"
+
+        # Output length: at least sequence_length, and also include horizon frame
+        T_out = max(self.sequence_length, target_t + 1)
+
+        # base sequence: GT frames 0..T_out-1
+        samples = feats_proc[:, :T_out].clone()     # [B, T_out, H, W, C]
+
+        # copy last context frame forward for t > last_context_idx
+        x_context = feats_proc[:, last_context_idx]  # [B,H,W,C]
+        if last_context_idx + 1 < T_out:
+            samples[:, last_context_idx + 1:T_out] = x_context.unsqueeze(1).expand(
+                -1, T_out - last_context_idx - 1, -1, -1, -1
+            )
+
+        # prediction and GT at the requested horizon
+        x_pred = samples[:, target_t]  # [B,H,W,C]
+        x_gt   = feats_proc[:, target_t]  # [B,H,W,C]
 
         loss = self.calculate_loss(x_pred, x_gt)
-
-        # construct a sequence [0..4] with predicted frame at target_t
-        samples = feats[:, :self.sequence_length].clone()
-        samples[:, -1] = x_pred
 
         return samples, loss
 
@@ -679,20 +712,27 @@ class Dino_f(pl.LightningModule):
         self.log('val/loss', loss_val, prog_bar=True, batch_size=B, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         self.mean_metric.update(loss_val.detach())
 
-        # -------- Depth eval alignment --------
+        # -------- Depth and pose eval --------
+        per_layer_dims = (1024, 768, 768, 768)
+        head_outputs = []
+        for t in range(samples.shape[1]):
+            head_in = self._create_head_input(samples[:, t], per_layer_dims=per_layer_dims)   
+            with torch.no_grad():
+                head_out = self.head(head_in, img_info=self.head_img_hw)
+                head_outputs.append(head_out)
+
         if self.args.eval_midterm:
             horizon_idx = self.horizon_idx_unroll  # 6
         else:
             horizon_idx = self.target_t            # 4
-
-        pred_last = samples[:, -1]  # [B,Hf,Wf,C]
-        per_layer_dims = (1024, 768, 768, 768)
-        head_in_tgt = self._create_head_input(pred_last, per_layer_dims=per_layer_dims, add_dummy_pose_token_on_last=True)
-        with torch.no_grad():
-            head_out_tgt = self.head(head_in_tgt, img_info=self.head_img_hw)
-
+    
+        # Evaluate depth only on horizon index
         gt_depth_t = depth[:, horizon_idx].to(self.device)
-        self._update_depth_metrics_from_head(head_out_tgt, gt_depth_t)
+        self._update_depth_metrics_from_head(head_outputs[-1], gt_depth_t)
+
+        # Evaluate pose on trajectory from last context to horizon idx (including)
+        gt_pose_traj = pose[:, self.last_context_idx:horizon_idx+1]
+        self._update_pose_metrics_from_head(head_outputs[self.last_context_idx:], gt_pose_traj)
 
     def on_validation_epoch_start(self):
         n = getattr(self.args, "eval3d_every_n_epochs", 0) or 0
@@ -700,37 +740,36 @@ class Dino_f(pl.LightningModule):
     
     def on_validation_epoch_end(self):
         mean_loss = self.mean_metric.compute()
-
-        # Always log loss
         logs = {
             'val/loss': mean_loss,
         }
 
-        # 3D-eval epoch (either eval-only or periodic 3D eval)
         if self.args.eval_mode or getattr(self, "_do_eval3d_this_epoch", False):
-            # log ONLY 3D depth metrics (if they were updated)
+            # depth metrics
             logs['val/depth_absrel'] = self.depth_absrel_m.compute()
             logs['val/depth_delta1'] = self.depth_delta1_m.compute()
+
+            # pose metrics
+            logs['val/pose_ate']       = self.pose_ate_m.compute()
+            logs['val/pose_rpe_trans'] = self.pose_rpe_t_m.compute()
+            logs['val/pose_rpe_rot']   = self.pose_rpe_r_m.compute()
 
             # reset 3D metrics
             self.depth_absrel_m.reset()
             self.depth_delta1_m.reset()
-
+            self.pose_ate_m.reset()
+            self.pose_rpe_t_m.reset()
+            self.pose_rpe_r_m.reset()
         else:
-            # normal feature-only validation epoch:
-            # log ONLY feature-fit metrics
+            # feature-only metrics as you already had
             logs['val/ff_mse'] = self.ff_mse.compute()
             logs['val/ff_mae'] = self.ff_mae.compute()
             logs['val/ff_cos'] = self.ff_cos.compute()
-
-            # reset feature metrics
             self.ff_mse.reset()
             self.ff_mae.reset()
             self.ff_cos.reset()
 
-        # common reset
         self.mean_metric.reset()
-
         self.log_dict(logs, prog_bar=True, logger=True)
             
     def configure_optimizers(self):
@@ -776,19 +815,16 @@ class Dino_f(pl.LightningModule):
                                 interval='step',
                                 frequency=1)]"""
 
-    def _create_head_input(self, x_last: torch.Tensor, per_layer_dims=None, add_dummy_pose_token_on_last=False):
+    def _create_head_input(self, x_last: torch.Tensor, per_layer_dims=None):
         """
-        x_last: [B, Hf, Wf, C] or [B, S, C]
+        x_last: [B, Hf, Wf, C]
         Returns: [l0, l1, l2, l3], each [B, S, d_i]
         Optionally prepends a dummy pose token on the last layer.
         """
-        if x_last.dim() == 4:  # [B,Hf,Wf,C]
+        if x_last.dim() == 4:  # [B,T,Hf,Wf,C]
             B, Hf, Wf, C = x_last.shape
             S = Hf * Wf
             x_flat = x_last.view(B, S, C)
-        elif x_last.dim() == 3:  # [B,S,C]
-            x_flat = x_last
-            B, S, C = x_flat.shape
         else:
             raise ValueError(f"Unexpected feat shape {tuple(x_last.shape)}")
 
@@ -804,9 +840,15 @@ class Dino_f(pl.LightningModule):
         l2 = x_flat[:, :, d0+d1:d0+d1+d2]
         l3 = x_flat[:, :, d0+d1+d2:d0+d1+d2+d3]
 
-        if add_dummy_pose_token_on_last:
+        if not self.pose_token_mode:
+            # Add dummy pose token
             dummy_pose_token = torch.zeros(B, 1, d3, device=l3.device, dtype=l3.dtype)
             l3 = torch.cat([dummy_pose_token, l3], dim=1)
+        else:
+            # Cut pose token from l0 to l2
+            l0 = l0[:, 1:]
+            l1 = l1[:, 1:]
+            l2 = l2[:, 1:]
 
         return [l0, l1, l2, l3]
 
@@ -899,10 +941,81 @@ class Dino_f(pl.LightningModule):
             self.depth_delta1_m.update(delta1_t, weight=weight_t)
         
     @torch.no_grad()
-    def _update_pose_metrics_from_head(
-        self
-    ):
-        pass
-        # TODO
+    def _update_pose_metrics_from_head(self, head_output_traj, gt_pose_traj):
+        """
+        head_output_traj: list of length L
+            each element is a head output dict for one time step, with key:
+                "camera_pose": [B, 7]  (TUM-like pose: x,y,z,qw,qx,qy,qz)
+
+        gt_pose_traj: [B, L, 4, 4]
+            ground-truth camera-to-world poses over the same time range
+
+        For each batch element, we:
+          - build a small predicted trajectory (L poses) from the head outputs
+          - build the corresponding GT trajectory from the 4x4 matrices
+          - call CUT3R's eval_metrics(pred_traj, gt_traj, ...)
+          - update ATE / RPE metrics
+        """
+        if head_output_traj is None or gt_pose_traj is None:
+            return
+
+        # L = number of evaluated frames (e.g. horizon_idx - last_context_idx + 1)
+        B, L, _, _ = gt_pose_traj.shape
+        if L == 0:
+            return
+
+        # Collect predicted camera_pose across time: list length L -> [B, L, 7]
+        cam_pose_list = []
+        for out_t in head_output_traj:
+            if out_t is None or "camera_pose" not in out_t:
+                return
+            cam_pose_t = out_t["camera_pose"]  # [B, 7]
+            if not isinstance(cam_pose_t, torch.Tensor):
+                cam_pose_t = torch.as_tensor(cam_pose_t, device=self.device)
+            cam_pose_list.append(cam_pose_t)
+
+        pred_poses = torch.stack(cam_pose_list, dim=1)  # [B, L, 7]
+
+        # Move to CPU for numpy / evo
+        pred_poses_np = pred_poses.detach().cpu().numpy()   # [B, L, 7]
+        gt_poses_np   = gt_pose_traj.detach().cpu().numpy() # [B, L, 4, 4]
+
+        # Simple frame-based timestamps 0..L-1
+        timestamps = np.arange(L).astype(float)
+
+        for b in range(B):
+            # ----- predicted trajectory (already TUM 7D) -----
+            pred_tum = pred_poses_np[b]  # [L, 7]
+
+            # If your head uses different quaternion order (e.g. x,y,z,qx,qy,qz,qw),
+            # you would re-order here before passing pred_tum into eval_metrics.
+
+            # ----- GT trajectory: 4x4 -> TUM 7D using c2w_to_tumpose -----
+            gt_c2w_b = gt_poses_np[b]    # [L, 4, 4]
+            gt_tum = np.stack(
+                [c2w_to_tumpose(gt_c2w_b[t]) for t in range(L)],
+                axis=0
+            )  # [L, 7]
+
+            # Build the tuple format expected by eval_metrics:
+            #   (traj_tum, timestamps)
+            pred_traj = [pred_tum, timestamps]
+            gt_traj   = [gt_tum, timestamps]
+
+            # Use CUT3R's eval_metrics directly.
+            # filename goes to os.devnull so we don't write per-sample txt files.
+            ate, rpe_trans, rpe_rot = eval_metrics(
+                pred_traj,
+                gt_traj,
+                seq="",  # unused here
+                filename=os.devnull,
+                sample_stride=1,
+            )
+
+            # Update aggregated pose metrics
+            dev = self.device
+            self.pose_ate_m.update(torch.tensor(ate,       device=dev, dtype=torch.float32))
+            self.pose_rpe_t_m.update(torch.tensor(rpe_trans, device=dev, dtype=torch.float32))
+            self.pose_rpe_r_m.update(torch.tensor(rpe_rot,   device=dev, dtype=torch.float32))
 
         

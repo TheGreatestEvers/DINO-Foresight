@@ -226,11 +226,11 @@ def setup_args_defaults(args):
 
     args.pose_token_mode = True
 
-    args.eval_ckpt_only = False
-    args.ckpt = None
-    args.warmup_p = 0.04
+    args.eval_ckpt_only = True
+    args.ckpt = "/workspace/DINO-Foresight/lightning_logs/version_48/checkpoints/epoch=77-step=36816-val_loss=0.00000.ckpt"
+    args.batch_size=1
     
-    args.eval_mode = False  # will flip to True when evaluating
+    args.eval_mode = True  # will flip to True when evaluating
     return args
 
 def setup_dist_env(args):
