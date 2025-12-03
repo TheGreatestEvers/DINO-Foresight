@@ -64,6 +64,11 @@ if not DEBUG:
         train_ds = SelectedFusedImgFeatConcatDataset(args.train_features_path)
         val_ds   = SelectedFusedImgFeatConcatDataset(args.val_features_path, return_view=True)
 
+        #MAX_SAMPLES = 1
+        #torch.manual_seed=123
+        #perm = torch.randperm(len(val_ds))[:MAX_SAMPLES].tolist()
+        #val_ds = Subset(val_ds, perm)
+
         train_loader = DataLoader(
             train_ds, batch_size=args.batch_size, shuffle=True,
             num_workers=args.num_workers, pin_memory=True, drop_last=True,
@@ -227,8 +232,8 @@ def setup_args_defaults(args):
     args.pose_token_mode = True
 
     args.eval_ckpt_only = True
-    args.ckpt = "/workspace/DINO-Foresight/lightning_logs/version_48/checkpoints/epoch=77-step=36816-val_loss=0.00000.ckpt"
-    args.batch_size=1
+    args.ckpt = "/workspace/epoch=78-step=37288-val_loss=0.00000.ckpt"
+    args.batch_size=8
     
     args.eval_mode = True  # will flip to True when evaluating
     return args
@@ -416,38 +421,56 @@ def main():
 
     # -------------------- Evaluation --------------------
     if args.evaluate or args.eval_ckpt_only:
-        # Turn on the 3D+pose eval route inside your LightningModule
+
         args.eval_mode = True
 
-        # Decide which checkpoint to evaluate
-        ckpt_path = resolve_checkpoint_for_eval(args, ckpt_cb, trainer.logger.log_dir if trainer.logger else None)
+        ckpt_path = resolve_checkpoint_for_eval(
+            args, ckpt_cb, trainer.logger.log_dir if trainer.logger else None
+        )
         if not ckpt_path or not os.path.isfile(ckpt_path):
-            # If nothing found but user gave --ckpt earlier and we just trained, try best_model_path now
             ckpt_path = getattr(ckpt_cb, "best_model_path", "") or getattr(ckpt_cb, "last_model_path", "")
         if not ckpt_path or not os.path.isfile(ckpt_path):
-            raise FileNotFoundError("Could not find a checkpoint to evaluate. "
-                                    "Pass --ckpt, or ensure training saved checkpoints.")
+            raise FileNotFoundError("Could not find a checkpoint to evaluate.")
 
         print(f'[Eval] Loading checkpoint: {ckpt_path}')
         model = Dino_f.load_from_checkpoint(ckpt_path, args=args, strict=False, map_location="cpu")
         model.to(args.device).eval()
 
-        # validate() returns a list of dicts (one per dataloader)
         out_metrics = trainer.validate(model=model, dataloaders=val_loader, verbose=False) or [{}]
         m0 = out_metrics[0] if out_metrics else {}
 
-        # Gather the key results you care about
+        # -------------------------------------------------------------------------
+        # NEW: collect pose_eval_count and pose_skip_count (same naming as in Logs)
+        # -------------------------------------------------------------------------
+        pose_eval_count = m0.get("val/pose_eval_count", 0.0)
+        pose_skip_count = m0.get("val/pose_skip_count", 0.0)
+
+        # Now prepare your normal metrics dict
         results = {}
-        for k in ("val/mean_loss", "val/loss", "val/ff_mse", "val/ff_mae", "val/ff_cos",
-                  "val/depth_absrel", "val/depth_delta1",
-                  "val/pose_ATE_m", "val/pose_RPE_t_m", "val/pose_RPE_r_deg"):
+        for k in (
+            "val/mean_loss", "val/loss",
+            "val/ff_mse", "val/ff_mae", "val/ff_cos",
+            "val/depth_absrel", "val/depth_delta1",
+            "val/pose_ate", "val/pose_rpe_trans", "val/pose_rpe_rot",
+        ):
             if k in m0:
                 results[k] = m0[k]
 
-        # Also keep a plain 'Mean Loss' line for legacy readers
+        # Legacy mean-loss
         if "val/mean_loss" in m0:
             results["Mean Loss"] = m0["val/mean_loss"]
 
+        # -------------------------------------------------------------------------
+        # NEW: Append pose eval counters to results.txt
+        # -------------------------------------------------------------------------
+        results["pose_eval_count"] = pose_eval_count
+        results["pose_skip_count"] = pose_skip_count
+
+        total = pose_eval_count + pose_skip_count
+        if total > 0:
+            results["pose_eval_fraction"] = pose_eval_count / total
+
+        # Write final .txt
         write_results(trainer.log_dir, results)
 
 if __name__ == "__main__":

@@ -21,9 +21,92 @@ import timm
 import torch.nn.functional as F
 
 sys.path.append("/workspace/CUT3R")
+sys.path.append("/workspace/CUT3R/src")
 from eval.video_depth.tools import depth_evaluation
 from eval.relpose.evo_utils import eval_metrics
 from eval.relpose.utils import c2w_to_tumpose
+from src.dust3r.utils.camera import pose_encoding_to_camera
+
+import numpy as np
+
+def debug_check_trajectory(pred_traj, gt_traj, name="traj"):
+    """
+    pred_traj: [L,7] numpy or tensor (x,y,z,qw,qx,qy,qz)
+    gt_traj:   [L,7]
+    """
+    # Convert to numpy
+    if hasattr(pred_traj, "detach"):
+        pred_traj = pred_traj.detach().cpu().numpy()
+    if hasattr(gt_traj, "detach"):
+        gt_traj = gt_traj.detach().cpu().numpy()
+
+    # pred_traj and gt_traj come in as lists from get_tum_poses: [poses, timestamps]
+    if isinstance(pred_traj, list):
+        pred_traj = pred_traj[0]
+    if isinstance(gt_traj, list):
+        gt_traj = gt_traj[0]
+
+    print("\n================= TRAJ DEBUG =================")
+    print(f"Traj name: {name}")
+    print(f"Pred shape: {pred_traj.shape}, GT shape: {gt_traj.shape}")
+
+    # --- 1. Shape checks ---
+    if pred_traj.ndim != 2 or pred_traj.shape[1] != 7:
+        print("❌ invalid pred traj shape (must be [L,7])")
+    if gt_traj.ndim != 2 or gt_traj.shape[1] != 7:
+        print("❌ invalid GT traj shape (must be [L,7])")
+
+    L = pred_traj.shape[0]
+    print(f"L = {L} poses")
+
+    # --- 2. Too few poses ---
+    if L < 3:
+        print("⚠️ WARNING: Only %d poses — Umeyama alignment may fail." % L)
+
+    # --- 3. Check for NaNs / Infs ---
+    if not np.isfinite(pred_traj).all():
+        print("❌ pred has NaN/Inf!")
+    if not np.isfinite(gt_traj).all():
+        print("❌ gt has NaN/Inf!")
+
+    # --- 4. Motion extent ---
+    pred_xyz = pred_traj[:, :3]
+    gt_xyz = gt_traj[:, :3]
+
+    print("Pred span:", np.linalg.norm(pred_xyz[-1] - pred_xyz[0]))
+    print("GT span:  ", np.linalg.norm(gt_xyz[-1] - gt_xyz[0]))
+
+    if np.allclose(pred_xyz, pred_xyz[0], atol=1e-6):
+        print("⚠️ pred camera centers constant (no motion)")
+
+    if np.allclose(gt_xyz, gt_xyz[0], atol=1e-6):
+        print("⚠️ GT centers constant (GT might be broken)")
+
+    # --- 5. Covariance rank check (critical for Umeyama) ---
+    C = np.cov(pred_xyz.T)
+    rank = np.linalg.matrix_rank(C)
+    print("Pred covariance rank:", rank)
+
+    if rank < 2:
+        print("❌ Degenerate covariance — Umeyama WILL fail.")
+
+    # --- 6. Check quaternion normalization ---
+    pred_q = pred_traj[:, 3:]
+    gt_q   = gt_traj[:, 3:]
+
+    pred_norm = np.linalg.norm(pred_q, axis=1)
+    gt_norm   = np.linalg.norm(gt_q, axis=1)
+
+    print("Quaternion mean norms: pred=%.3f gt=%.3f" %
+          (pred_norm.mean(), gt_norm.mean()))
+
+    if not np.allclose(pred_norm, 1.0, atol=0.1):
+        print("⚠️ Pred quaternions not normalized")
+
+    if not np.allclose(gt_norm, 1.0, atol=0.1):
+        print("⚠️ GT quaternions not normalized")
+
+    print("=============== END TRAJ DEBUG ===============\n")
 
 
 class Dino_f(pl.LightningModule):
@@ -80,6 +163,9 @@ class Dino_f(pl.LightningModule):
 
             # horizon frame index (in the original 7-frame GT sequence) for midterm eval
             self.horizon_idx_unroll = self.context_len - 1 + self.unroll_steps  # 3 + 3 = 6
+
+            self.pose_eval_count = 0
+            self.pose_skip_count = 0
 
         else:
             pass
@@ -524,17 +610,6 @@ class Dino_f(pl.LightningModule):
 
         return prediction, loss
 
-        # After unroll, interpret the LAST frame as the horizon prediction
-        prediction = self.postprocess(x)      # back to original feature space
-        pred_horizon = prediction[:, -1]      # [B, H, W, C] at horizon
-
-        # gt_feats: [B, H, W, C] for the horizon frame (e.g. feats[:, 6] after reshape)
-        loss = self.calculate_loss(
-            pred_horizon.flatten(end_dim=-2),
-            gt_feats.flatten(end_dim=-2)
-        )
-        return prediction, loss
-
     def forward(self, x, masked_x, mask=None):
         if self.args.vis_attn:
             x_pred, attn = self.maskvit(masked_x,return_attn=True)
@@ -678,7 +753,11 @@ class Dino_f(pl.LightningModule):
             else:
                 samples, loss = self.sample_baseline_copy_last(feats)
         elif self.args.evaluate_oracle:
-            samples = self.preprocess(feats)
+            if self.args.eval_midterm:
+                samples = feats # [B, T, S, C]
+                samples = samples.unsqueeze(2) # [B, T, 1, W, C]
+            else:
+                samples = self.preprocess(feats)
             loss = torch.tensor(0, device=self.device)
         else:
             if self.args.eval_midterm:
@@ -689,10 +768,8 @@ class Dino_f(pl.LightningModule):
 
                 # You may need to reshape feats[:, horizon_idx] to [B, H, W, C] if it is [B, HW+1, C]
                 # For external features, that might look like:
-                B, T, HW_plus1, C = feats.shape
-                Hf, Wf = self.args.feat_hw
-                gt_feats_horizon = feats[:, horizon_idx, 1:]           # drop pose token
-                gt_feats_horizon = gt_feats_horizon.view(B, Hf, Wf, C) # [B,Hf,Wf,C]
+                gt_feats_horizon = feats[:, horizon_idx]    # [B, S, C]
+                gt_feats_horizon = gt_feats_horizon.unsqueeze(1) #[B, 1, S, C]
 
                 samples, loss = self.sample_unroll(
                     feats,                   # raw features sequence
@@ -731,8 +808,10 @@ class Dino_f(pl.LightningModule):
         self._update_depth_metrics_from_head(head_outputs[-1], gt_depth_t)
 
         # Evaluate pose on trajectory from last context to horizon idx (including)
-        gt_pose_traj = pose[:, self.last_context_idx:horizon_idx+1]
-        self._update_pose_metrics_from_head(head_outputs[self.last_context_idx:], gt_pose_traj)
+        #gt_pose_traj = pose[:, self.last_context_idx:horizon_idx+1]
+        #self._update_pose_metrics_from_head(head_outputs[self.last_context_idx:], gt_pose_traj)
+        gt_pose_traj = pose[:,:horizon_idx+1]
+        self._update_pose_metrics_from_head(head_outputs, gt_pose_traj)
 
     def on_validation_epoch_start(self):
         n = getattr(self.args, "eval3d_every_n_epochs", 0) or 0
@@ -743,6 +822,9 @@ class Dino_f(pl.LightningModule):
         logs = {
             'val/loss': mean_loss,
         }
+
+        self.log("val/pose_eval_count", float(self.pose_eval_count), prog_bar=True, sync_dist=True)
+        self.log("val/pose_skip_count", float(self.pose_skip_count), prog_bar=True, sync_dist=True)
 
         if self.args.eval_mode or getattr(self, "_do_eval3d_this_epoch", False):
             # depth metrics
@@ -942,80 +1024,71 @@ class Dino_f(pl.LightningModule):
         
     @torch.no_grad()
     def _update_pose_metrics_from_head(self, head_output_traj, gt_pose_traj):
-        """
-        head_output_traj: list of length L
-            each element is a head output dict for one time step, with key:
-                "camera_pose": [B, 7]  (TUM-like pose: x,y,z,qw,qx,qy,qz)
-
-        gt_pose_traj: [B, L, 4, 4]
-            ground-truth camera-to-world poses over the same time range
-
-        For each batch element, we:
-          - build a small predicted trajectory (L poses) from the head outputs
-          - build the corresponding GT trajectory from the 4x4 matrices
-          - call CUT3R's eval_metrics(pred_traj, gt_traj, ...)
-          - update ATE / RPE metrics
-        """
         if head_output_traj is None or gt_pose_traj is None:
             return
+        assert len(head_output_traj) == gt_pose_traj.shape[1], "trajectory length missmatch"
 
-        # L = number of evaluated frames (e.g. horizon_idx - last_context_idx + 1)
         B, L, _, _ = gt_pose_traj.shape
-        if L == 0:
+        if L < 2:
             return
 
-        # Collect predicted camera_pose across time: list length L -> [B, L, 7]
-        cam_pose_list = []
-        for out_t in head_output_traj:
+        # Build predicted pose encodings [B, L, 7]  (NOT yet TUM)
+        pose_enc_list = []
+        for out_t in head_output_traj:      # length L
             if out_t is None or "camera_pose" not in out_t:
                 return
-            cam_pose_t = out_t["camera_pose"]  # [B, 7]
-            if not isinstance(cam_pose_t, torch.Tensor):
-                cam_pose_t = torch.as_tensor(cam_pose_t, device=self.device)
-            cam_pose_list.append(cam_pose_t)
+            pose_enc_t = out_t["camera_pose"]    # [B,7]
+            if not isinstance(pose_enc_t, torch.Tensor):
+                pose_enc_t = torch.as_tensor(pose_enc_t, device=self.device)
+            pose_enc_list.append(pose_enc_t)
 
-        pred_poses = torch.stack(cam_pose_list, dim=1)  # [B, L, 7]
-
-        # Move to CPU for numpy / evo
-        pred_poses_np = pred_poses.detach().cpu().numpy()   # [B, L, 7]
-        gt_poses_np   = gt_pose_traj.detach().cpu().numpy() # [B, L, 4, 4]
-
-        # Simple frame-based timestamps 0..L-1
-        timestamps = np.arange(L).astype(float)
+        pred_pose_enc = torch.stack(pose_enc_list, dim=1)  # [B, L, 7]
+        gt_np   = gt_pose_traj.detach().cpu().numpy()
+        dev     = self.device
 
         for b in range(B):
-            # ----- predicted trajectory (already TUM 7D) -----
-            pred_tum = pred_poses_np[b]  # [L, 7]
+            #print("b:")
+            enc_seq = pred_pose_enc[b]          # [L,7] encoding
+            # Convert encoding -> 4x4 c2w matrices using their helper
+            c2w_seq = pose_encoding_to_camera(enc_seq)   # [L,4,4]
+            #print(c2w_seq)
 
-            # If your head uses different quaternion order (e.g. x,y,z,qx,qy,qz,qw),
-            # you would re-order here before passing pred_tum into eval_metrics.
+            # Convert c2w -> TUM poses like they do
+            c2w_np = c2w_seq.detach().cpu().numpy()
+            pred_tum = np.stack(
+                [c2w_to_tumpose(c2w_np[t]) for t in range(L)], axis=0
+            )   # [L,7]
 
-            # ----- GT trajectory: 4x4 -> TUM 7D using c2w_to_tumpose -----
-            gt_c2w_b = gt_poses_np[b]    # [L, 4, 4]
+            # GT: we already know gt_pose_traj[b, t] is 4x4 c2w
+            gt_c2w_b = gt_np[b]      # [L,4,4]
+            #print(gt_c2w_b)
             gt_tum = np.stack(
-                [c2w_to_tumpose(gt_c2w_b[t]) for t in range(L)],
-                axis=0
-            )  # [L, 7]
-
-            # Build the tuple format expected by eval_metrics:
-            #   (traj_tum, timestamps)
-            pred_traj = [pred_tum, timestamps]
-            gt_traj   = [gt_tum, timestamps]
-
-            # Use CUT3R's eval_metrics directly.
-            # filename goes to os.devnull so we don't write per-sample txt files.
-            ate, rpe_trans, rpe_rot = eval_metrics(
-                pred_traj,
-                gt_traj,
-                seq="",  # unused here
-                filename=os.devnull,
-                sample_stride=1,
+                [c2w_to_tumpose(gt_c2w_b[t]) for t in range(L)], axis=0
             )
 
-            # Update aggregated pose metrics
-            dev = self.device
-            self.pose_ate_m.update(torch.tensor(ate,       device=dev, dtype=torch.float32))
+            timestamps = np.arange(L).astype(float)
+            pred_traj = [pred_tum, timestamps]
+            gt_traj   = [gt_tum,  timestamps]
+
+            try:
+                ate, rpe_trans, rpe_rot = eval_metrics(
+                    pred_traj,
+                    gt_traj,
+                    seq="",
+                    filename=os.devnull,
+                    sample_stride=1,
+                )
+                #print(f"ate: {ate}, rpe_t: {rpe_trans}")
+            except Exception as e:
+                msg = str(e)
+                if "Degenerate covariance rank" in msg or "Eigenvalues did not converge" in msg:
+                    self.pose_skip_count += 1
+                    continue
+                else:
+                    raise
+
+            self.pose_eval_count += 1
+            self.pose_ate_m.update(torch.tensor(ate,        device=dev, dtype=torch.float32))
             self.pose_rpe_t_m.update(torch.tensor(rpe_trans, device=dev, dtype=torch.float32))
             self.pose_rpe_r_m.update(torch.tensor(rpe_rot,   device=dev, dtype=torch.float32))
-
         
